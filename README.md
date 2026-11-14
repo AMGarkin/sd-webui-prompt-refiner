@@ -1,12 +1,12 @@
 # Prompt Refiner (Forge Classic / Neo)
 
 Adds a **Prompt Refiner** tab that rewrites prompts with a local LLM - using the same
-Qwen3 / Qwen3-VL text encoder file you already use for image generation with Krea 2, Flux.2 Klein or Z-Image.
+Qwen3 / Qwen3-VL text encoder file you already use for image generation with Krea 2, Flux.2 Klein or Z-Image.  
 No Ollama / LM Studio required.
 
 ## Install
-On the extension tab in Forge Neo UI select from URL and insert URL of this repository
-or clone the repository manually into `<forge>/extensions/` and restart Forge.
+In Forge Neo open **Extension** tab -> **Install from URL** and enter URL of this repository.  
+Or clone the repository manually into `<forge>/extensions/` and restart Forge.
 
 ## Use
 1. Put a Qwen3 / Qwen3-VL text encoder (e.g. `qwen3vl_4b_int8_convrot.safetensors`) in `models/text_encoder/`.
@@ -21,6 +21,7 @@ or clone the repository manually into `<forge>/extensions/` and restart Forge.
 - By default the model is unloaded after each run to free VRAM.
 - System prompt presets live in `presets.json` and are editable in the UI.
 - I do not recommend using "thinking" models. They are slow - requiring 3-4 times more tokens and time than "instruct" models - yet the results are no better.
+- If possible, use the int8 ConvRot format. It runs twice as fast as fp8.
 
 ## Low-VRAM mode (8 GB cards)
 int8 / fp8 weights (incl. int8 ConvRot) are kept compressed in VRAM (~4.8 GB for Qwen3-VL 4B) instead of being expanded to bf16 (~8 GB).
@@ -32,4 +33,3 @@ automatic fallback to plain PyTorch). The status line shows which path was used.
 - Block-wise FP8 is re-encoded to row-wise int8 on load so it stays small in VRAM.
 - Optional "compress bf16/fp16 to int8" lets 8 GB cards run full-size files.
 - Thinking models: `<think>` blocks are stripped from the result; raise "Max new tokens" for them (~2048).
-
