@@ -13,11 +13,13 @@ Qwen3.5, MoE, other model families, and image inputs are not supported.
 
 import gc
 import json
+import os
 import queue
 import random
 import re
 import sys
 import threading
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,9 +35,11 @@ if str(EXT_DIR) not in sys.path:
 
 # Forge imports extension scripts without guaranteeing their root is on sys.path.
 from prompt_refiner_lib import checkpoints, models  # noqa: E402
+from prompt_refiner_lib.preferences import SettingsStore  # noqa: E402
 from prompt_refiner_lib.quantization import QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
 
 PRESETS_FILE = EXT_DIR / "presets.json"
+SETTINGS_FILE = EXT_DIR / "settings.json"
 LOCAL_TOKENIZER_DIR = EXT_DIR / "tokenizer"
 
 _RUN_LOCK = threading.Lock()
@@ -92,20 +96,81 @@ DEFAULT_PRESETS = {
 }
 
 
+_PRESET_LOCK = threading.RLock()
+
+
 def load_presets():
-    if PRESETS_FILE.is_file():
-        try:
-            data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data:
-                return data
-        except Exception:
-            pass
-    save_presets(DEFAULT_PRESETS)
-    return dict(DEFAULT_PRESETS)
+    """Read presets without overwriting malformed files; missing files use defaults."""
+    if not PRESETS_FILE.exists():
+        return dict(DEFAULT_PRESETS)
+    data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or any(
+        not isinstance(name, str) or not name.strip() or not isinstance(text, str)
+        for name, text in data.items()
+    ):
+        raise ValueError("The presets file must contain an object mapping names to text.")
+    return data
+
+
+def _replace_preset_file(path, content):
+    """Replace a file atomically using a temporary file on the same filesystem."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def save_presets(data):
-    PRESETS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    """Keep one previous version before atomically replacing the current presets."""
+    content = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    with _PRESET_LOCK:
+        if PRESETS_FILE.exists():
+            _replace_preset_file(PRESETS_FILE.with_suffix(".json.bak"), PRESETS_FILE.read_bytes())
+        _replace_preset_file(PRESETS_FILE, content)
+
+
+def select_preset_ui(name):
+    """Populate both editable fields from a user-selected preset without exceptions."""
+    try:
+        data = load_presets()
+        return data.get(name, ""), name or "", ""
+    except (OSError, ValueError) as exc:
+        message = f"Could not read presets: {exc}. Check presets.json before trying again."
+        print(f"[Prompt Refiner] {message}", flush=True)
+        return gr.update(), gr.update(), message
+
+
+def change_preset_ui(name, text=None, delete=False):
+    """Save or delete a preset, preserving the editor on validation or disk errors."""
+    name = (name or "").strip()
+    if not name:
+        message = "Select a preset to delete." if delete else "Enter a preset name before saving."
+        print(f"[Prompt Refiner] {message}", flush=True)
+        return gr.update(), gr.update(), gr.update(), message
+    try:
+        with _PRESET_LOCK:
+            data = load_presets()
+            existed = name in data
+            if delete:
+                if not existed:
+                    return gr.update(), gr.update(), gr.update(), "The selected preset no longer exists."
+                del data[name]
+            else:
+                data[name] = text or ""
+            save_presets(data)
+        selected = next(iter(data), None) if delete else name
+        message = f'Preset "{name}" deleted.' if delete else f'Preset "{name}" {"updated" if existed else "saved"}.'
+        print(f"[Prompt Refiner] {message}", flush=True)
+        return gr.update(choices=list(data), value=selected), data.get(selected, ""), selected or "", message
+    except (OSError, ValueError) as exc:
+        message = f"Could not {'delete' if delete else 'save'} the preset: {exc}. Your edits are still in the editor; check presets.json and folder write permissions."
+        print(f"[Prompt Refiner] {message}", flush=True)
+        return gr.update(), gr.update(), gr.update(), message
 
 
 # --------------------------------------------------------------------------------------
@@ -664,7 +729,13 @@ SEND_JS = """
 
 
 def on_ui_tabs():
-    presets = load_presets()
+    preset_message = ""
+    try:
+        presets = load_presets()
+    except (OSError, ValueError) as exc:
+        presets = dict(DEFAULT_PRESETS)
+        preset_message = f"Could not read presets.json: {exc}. The file was left unchanged; repair it or restore presets.json.bak before saving."
+        print(f"[Prompt Refiner] {preset_message}", flush=True)
     preset_names = list(presets.keys())
     encoders = list_encoders()
 
@@ -696,9 +767,12 @@ def on_ui_tabs():
                     system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
                                                value=presets[preset_names[0]] if preset_names else "")
                     with gr.Row():
-                        preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="My preset")
+                        preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="Name for a new preset",
+                                                 value=preset_names[0] if preset_names else "",
+                                                 info="Keep this name to update the preset, or change it to save a copy.")
                         save_btn = gr.Button("Save preset", scale=1)
-                        delete_btn = gr.Button("Delete selected", scale=1)
+                        delete_btn = gr.Button("Delete selected preset", scale=1)
+                    preset_status = gr.Textbox(label="Preset status", value=preset_message, interactive=False, lines=2)
 
             with gr.Column(scale=1):
                 output = gr.Textbox(label="Result", lines=14, interactive=True, show_copy_button=True)
@@ -758,6 +832,45 @@ def on_ui_tabs():
                 lm_btn = gr.Button("Download lm_head")
             lm_status = gr.HTML(value="")
 
+        # Persist only explicitly listed controls. Prompt/result text, unsaved
+        # instructions, preset-name drafts, download tokens, and status are excluded.
+        controls = {
+            "encoder": encoder, "preset": preset, "max_new_tokens": max_new,
+            "disable_thinking": empty_think, "temperature": temperature,
+            "top_p": top_p, "top_k": top_k, "min_p": min_p,
+            "repetition_penalty": rep_penalty, "seed": seed,
+            "family": family, "tokenizer_directory": tokenizer_override,
+            "device": device, "dtype": dtype, "rope": rope,
+            "keep_loaded": keep_loaded, "free_vram": free_vram,
+            "keep_quantized": keep_q, "compress": compress,
+            "lm_head": lm_choice, "lm_head_int8": lm_int8, "lm_head_repo": lm_repo,
+        }
+        choices = {
+            key: [choice[1] for choice in control.choices] + ([None] if control.value is None else [])
+            for key, control in controls.items() if isinstance(control, gr.Dropdown)
+        }
+        ranges = {
+            key: (control.minimum, control.maximum)
+            for key, control in controls.items() if isinstance(control, gr.Slider)
+        }
+        settings = SettingsStore(SETTINGS_FILE, {key: control.value for key, control in controls.items()}, choices, ranges)
+        for key, control in controls.items():
+            control.value = settings.values[key]
+        system_prompt.value = presets.get(preset.value, "")
+        preset_name.value = preset.value or ""
+        settings_status = gr.Textbox(label="Settings status", value=settings.message,
+                                     visible=bool(settings.message), interactive=False)
+
+        def _remember(key):
+            """Bind a single control to avoid overwriting other concurrent changes."""
+            def changed(value):
+                message = settings.update(key, value)
+                return gr.update(value=message, visible=bool(message))
+            return changed
+
+        for key, control in controls.items():
+            control.change(_remember(key), inputs=[control], outputs=[settings_status], show_progress="hidden")
+
         # ---- events ----
         def _refresh(current):
             names = list_encoders()
@@ -769,29 +882,13 @@ def on_ui_tabs():
         lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_int8, lm_token], outputs=[lm_status, lm_choice],
                      show_progress="hidden")
 
-        preset.change(lambda n: load_presets().get(n, ""), inputs=[preset], outputs=[system_prompt])
-
-        def _save(name, text):
-            name = (name or "").strip()
-            if not name:
-                raise gr.Error("Enter a preset name.")
-            data = load_presets()
-            data[name] = text
-            save_presets(data)
-            return gr.update(choices=list(data.keys()), value=name)
-
-        save_btn.click(_save, inputs=[preset_name, system_prompt], outputs=[preset])
-
-        def _delete(name):
-            data = load_presets()
-            data.pop(name, None)
-            if not data:
-                data = dict(DEFAULT_PRESETS)
-            save_presets(data)
-            first = next(iter(data))
-            return gr.update(choices=list(data.keys()), value=first), data[first]
-
-        delete_btn.click(_delete, inputs=[preset], outputs=[preset, system_prompt])
+        # Only user selection reloads the editor; programmatic dropdown updates
+        # must not clear the success/error message from a save or deletion.
+        preset.input(select_preset_ui, inputs=[preset], outputs=[system_prompt, preset_name, preset_status])
+        save_btn.click(change_preset_ui, inputs=[preset_name, system_prompt],
+                       outputs=[preset, system_prompt, preset_name, preset_status])
+        delete_btn.click(lambda name: change_preset_ui(name, delete=True), inputs=[preset],
+                         outputs=[preset, system_prompt, preset_name, preset_status])
 
         def _run_with_details(*args):
             """Keep routine status short and put model diagnostics in their own panel."""
@@ -812,6 +909,13 @@ def on_ui_tabs():
 
         send_txt.click(fn=None, inputs=[output], outputs=None, js=SEND_JS.replace("TAB", "txt2img"))
         send_img.click(fn=None, inputs=[output], outputs=None, js=SEND_JS.replace("TAB", "img2img"))
+
+    # Forge applies ui-config.json after rendering extension tabs. Its older
+    # defaults must not overwrite settings.json or restore text/secrets that this
+    # extension deliberately excludes from persistence. Use Neo's opt-out on all
+    # controls, including transient prompt, result, editor, and status fields.
+    for component in ui.blocks.values():
+        component.do_not_save_to_config = True
 
     return [(ui, "Prompt Refiner", "prompt_refiner")]
 

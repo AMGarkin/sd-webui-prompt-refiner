@@ -225,3 +225,9 @@ __marimo__/
 /tokenizer/**
 !/tokenizer/README.txt
 /tests/
+
+/presets.json.bak
+/presets.json.*.tmp
+
+/settings.json
+/settings.json.*.tmp

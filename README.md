@@ -18,7 +18,7 @@ not install or upgrade Forge's packages.
 1. Stop Forge Neo.
 2. Delete the extension folder, normally
    `<forge>/extensions/sd-webui-prompt-refiner/`. This also removes saved presets
-   (`presets.json`) and any tokenizers stored in its `tokenizer/<family>/` folders.
+   (`presets.json`, `presets.json.bak`, and `settings.json`) and any tokenizers stored in its `tokenizer/<family>/` folders.
    Back up these files first if you want to keep them.
 3. Delete downloaded output heads from
    `<forge>/models/prompt_refiner/lm_heads/`. These files are stored outside the
@@ -54,11 +54,33 @@ thinking is checked by default for switchable Qwen3 models. Expand **System prom
 below the result; expand **Model details** for tokenizer, quantization, device,
 and memory diagnostics or to unload the model manually.
 
+Selections and options are saved automatically on change to `settings.json` in
+the extension folder and restored after a page reload or Forge restart. These
+controls opt out of Forge's separate `ui-config.json` defaults so they cannot
+overwrite the extension's saved choices or restore excluded text fields. This
+includes the encoder, selected system prompt preset, checkboxes, sampling/model
+options, tokenizer directory, and LM head choices. A missing model, preset, or
+head falls back to the available default. Invalid saved values use defaults;
+settings read/write failures produce a nonfatal message in **Settings status**.
+Your prompt/idea, generated result, unsaved system prompt edits, preset-name draft,
+and Hugging Face token are never saved in this file. System instructions are
+saved only through **Save preset**. Delete `settings.json` while Forge is stopped
+to reset preferences.
+
 The model is unloaded after each run by default. **Keep model loaded** avoids
 reloading at the cost of occupied memory. **Unload model** releases it manually.
 Loading from disk is reported whenever needed; retaining a model only avoids
 reloading when the selected encoder and model settings still match.
-Presets are editable in the UI and saved in `presets.json`.
+Presets are editable in the UI and saved in `presets.json`. Selecting a preset
+fills both its instructions and name. **Save preset** updates that name; change
+the name to save a copy. **Delete selected preset** removes the selected entry,
+including the last entry if desired. Validation and file errors appear in
+**Preset status** without a console traceback, and failed saves preserve the editor.
+Before each save or deletion, an existing `presets.json` is copied to
+`presets.json.bak`, replacing the previous backup. To undo the last saved change,
+stop Forge, copy `presets.json.bak` over `presets.json`, and restart Forge. This is
+one previous version, not a backup history. Malformed files are never silently
+replaced with defaults. Both files are inside the extension folder.
 An empty prompt or missing encoder produces a status message without loading a
 model or raising an exception. The console logs skipped requests, the start of
 refinement, completion/stopping, and failures; prompt text is not logged.
