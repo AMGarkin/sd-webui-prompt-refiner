@@ -1,4 +1,4 @@
-"""Validated low-memory INT8, FP8, ConvRot, W4A8, and GGUF linear operations."""
+"""Validated low-memory INT8, FP8, ConvRot, grouped INT4/INT6, NVFP4, and GGUF operations."""
 
 import json
 
@@ -59,6 +59,9 @@ def _read_comfy_quant(f, keyset, base):
         "int8",
         "int8_tensorwise",
         "asym_w4a8_int8",
+        "w6a8_int8",
+        "convrot_w4a4",
+        "nvfp4",
     }
     if info["format"] not in allowed:
         raise ValueError(
@@ -176,8 +179,10 @@ def _requantize_rows(w, work_device):
 def _dequantize(f, keyset, key, dtype, work_device="cpu"):
     """Decode one weight using its exact layout; never reinterpret packed codes as INT8."""
     info = _read_comfy_quant(f, keyset, key[: -len(".weight")])
-    if info and info["format"] == "asym_w4a8_int8":
+    if info and info["format"] in ("asym_w4a8_int8", "w6a8_int8"):
         return W4A8Linear.from_checkpoint(f, keyset, key).to(work_device).dense(dtype)
+    if info and info["format"] in ("convrot_w4a4", "nvfp4"):
+        return PackedLinear.from_checkpoint(f, keyset, key).to(work_device).dense(dtype)
     w = f.get_tensor(key)
     _validate_layout(info, w, key)
     scale, block = _scale(f, keyset, key, w)
@@ -355,10 +360,12 @@ class QuantLinear(torch.nn.Module):
 
 
 def _load_quantized(f, keyset, key):
-    """Return the compressed one-byte row-scaled representation, or request dense fallback."""
+    """Return a validated packed module or one-byte row-scaled tuple; otherwise use dense loading."""
     info = _read_comfy_quant(f, keyset, key[: -len(".weight")])
-    if info and info["format"] == "asym_w4a8_int8":
+    if info and info["format"] in ("asym_w4a8_int8", "w6a8_int8"):
         return W4A8Linear.from_checkpoint(f, keyset, key)
+    if info and info["format"] in ("convrot_w4a4", "nvfp4"):
+        return PackedLinear.from_checkpoint(f, keyset, key)
     w = f.get_tensor(key)
     _validate_layout(info, w, key)
     if (
@@ -385,7 +392,7 @@ def _load_quantized(f, keyset, key):
 
 
 class W4A8Linear(torch.nn.Module):
-    """Keep Neo's packed W4A8 codes, group scales, channel scales, and codebook resident.
+    """Keep Neo's packed W4A8/W6A8 codes, group/channel scales and optional codebook resident.
 
     Comfy-Kitchen selects its native backend. A dense per-layer fallback preserves
     correctness on devices without an eligible INT8 kernel; weights stay packed
@@ -407,6 +414,7 @@ class W4A8Linear(torch.nn.Module):
         self.group_size, self.rotation = group_size, rotation
         self.out_features = weight.shape[0]
         self.in_features = relative.shape[1] * group_size
+        self.bits = weight.shape[1] * 8 // self.in_features
         self.register_buffer("bias", None, persistent=False)
         self._fallback = False
         self.params(torch.float32)  # validate before loading the rest of a model
@@ -416,7 +424,8 @@ class W4A8Linear(torch.nn.Module):
         """Read the canonical W4A8 layout, including optional asymmetric correction."""
         base = key[: -len(".weight")]
         info = _read_comfy_quant(f, keys, base)
-        group = int(info.get("group_size", 16))
+        bits = 6 if info["format"] == "w6a8_int8" else 4
+        group = int(info.get("group_size", 32 if bits == 6 else 16))
         rotation = int(info.get("convrot_groupsize", 256))
 
         def read(suffix, required=False):
@@ -434,13 +443,15 @@ class W4A8Linear(torch.nn.Module):
         if relative.ndim != 2 or weight.ndim != 2 or weight.dtype != torch.int8:
             raise ValueError(f"Invalid W4A8 tensor layout in {key}.")
         width = relative.shape[1] * group
-        if weight.shape != (relative.shape[0], width // 2):
+        if weight.shape != (relative.shape[0], width * bits // 8):
             raise ValueError(
-                f"W4A8 packed shape does not match its group scales: {key}"
+                f"W{bits}A8 packed shape does not match its group scales: {key}"
             )
         if not info.get("convrot", True):
             raise ValueError(f"Unrotated W4A8 is not supported: {key}")
         _rotation({"convrot": True, "convrot_groupsize": rotation}, width)
+        if bits == 6 and read("_codebook") is not None:
+            raise ValueError(f"Uniform W6A8 cannot contain a 4-bit codebook: {key}")
         return cls(
             weight,
             relative,
@@ -459,6 +470,13 @@ class W4A8Linear(torch.nn.Module):
             raise RuntimeError(
                 "W4A8 requires Forge Neo's Comfy-Kitchen with AsymW4A8Int8Layout support."
             ) from exc
+        if self.bits == 6:
+            import inspect
+
+            if "bits" not in inspect.signature(AsymW4A8Int8Layout.quantize).parameters:
+                raise RuntimeError(
+                    "W6A8 requires Neo's 6-bit-capable Comfy-Kitchen; update Forge Neo before using this format."
+                )
         return AsymW4A8Int8Layout.Params(
             scale=self.relative,
             s_channel=self.channel,
@@ -494,18 +512,222 @@ class W4A8Linear(torch.nn.Module):
         return torch.nn.functional.linear(x, self.dense(x.dtype), self.bias)
 
 
-class GGUFLinear(torch.nn.Module):
-    """Use Forge's packed GGUF tensors and dequantize only the active linear layer."""
+def packed_shape(f, keys, key, info):
+    """Recover original matrix dimensions without treating packed bytes as columns."""
+    shape = tuple(f.get_slice(key).get_shape())
+    if len(shape) != 2:
+        raise ValueError(f"Packed linear weight must be a matrix: {key}")
+    kind = info["format"]
+    if kind in ("asym_w4a8_int8", "w6a8_int8"):
+        relative = key + "_s_rel"
+        if relative not in keys:
+            raise ValueError(f"Missing grouped weight scales: {relative}")
+        rows, groups = f.get_slice(relative).get_shape()
+        return rows, groups * int(
+            info.get("group_size", 32 if kind == "w6a8_int8" else 16)
+        )
+    original = info.get("orig_shape")
+    if original is not None:
+        original = tuple(original)
+        if len(original) != 2 or any(type(n) is not int or n <= 0 for n in original):
+            raise ValueError(f"Invalid original packed shape: {key}")
+        return original
+    return shape[0], shape[1] * 2
 
-    def __init__(self, weight):
+
+class PackedLinear(torch.nn.Module):
+    """Keep INT4 ConvRot or NVFP4 codes resident; use native kernels or per-layer decode."""
+
+    def __init__(
+        self, weight, scale, scale2, kind, shape, rotation=0, input_scale=None
+    ):
+        super().__init__()
+        self.kind, self.rotation = kind, rotation
+        self.out_features, self.in_features = shape
+        for name, value in (
+            ("weight", weight),
+            ("scale", scale),
+            ("scale2", scale2),
+            ("input_scale", input_scale),
+        ):
+            self.register_buffer(name, value, persistent=False)
+        self.register_buffer("bias", None, persistent=False)
+        self._fallback = False
+        self.params(torch.float32)
+
+    @classmethod
+    def from_checkpoint(cls, f, keys, key):
+        info = _read_comfy_quant(f, keys, key[: -len(".weight")])
+        kind = info["format"]
+        shape = packed_shape(f, keys, key, info)
+        weight = f.get_tensor(key)
+        if weight.ndim != 2 or weight.dtype != (
+            torch.int8 if kind == "convrot_w4a4" else torch.uint8
+        ):
+            raise ValueError(f"Invalid {kind} byte storage: {key}")
+
+        def required(suffix):
+            name = key + suffix
+            if name not in keys:
+                raise ValueError(f"Missing {kind} tensor: {name}")
+            return f.get_tensor(name)
+
+        scale = required("_scale")
+        scale2 = None
+        rotation = 0
+        if kind == "convrot_w4a4":
+            rotation = _rotation(
+                {
+                    "convrot": True,
+                    "convrot_groupsize": info.get("convrot_groupsize", 256),
+                },
+                shape[1],
+            )
+            if int(info.get("quant_group_size", 64)) != 64 or weight.shape != (
+                shape[0],
+                shape[1] // 2,
+            ):
+                raise ValueError(f"Unsupported INT4 ConvRot packing/group size: {key}")
+            if (
+                scale.numel() != shape[0]
+                or not torch.isfinite(scale.float()).all()
+                or (scale.float() < 0).any()
+            ):
+                raise ValueError(f"Invalid INT4 row scales: {key}")
+            scale = scale.float().reshape(-1)
+        else:
+            scale2 = required("_scale_2").float()
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e4m3fn)
+            rows, cols = weight.shape
+            expected_scales = (
+                ((rows + 127) // 128) * 128,
+                (((cols * 2 // 16) + 3) // 4) * 4,
+            )
+            if (
+                rows % 16
+                or cols * 2 % 16
+                or tuple(scale.shape) != expected_scales
+                or scale.dtype != torch.float8_e4m3fn
+            ):
+                raise ValueError(
+                    f"Invalid NVFP4 padded/swizzled block scales: {key}; expected {expected_scales}"
+                )
+            if (
+                scale2.numel() != 1
+                or not torch.isfinite(scale2).all()
+                or (scale2 < 0).any()
+            ):
+                raise ValueError(f"Invalid NVFP4 global scale: {key}")
+            if shape[0] > rows or shape[1] > 2 * cols:
+                raise ValueError(
+                    f"NVFP4 original dimensions exceed packed storage: {key}"
+                )
+            pre = key[: -len("weight")] + "pre_quant_scale"
+            if pre in keys and not torch.all(f.get_tensor(pre) == 1):
+                raise ValueError(
+                    "Nontrivial NVFP4 pre_quant_scale is not supported; export un-smoothed weights."
+                )
+        inp = key[: -len("weight")] + "input_scale"
+        return cls(
+            weight,
+            scale,
+            scale2,
+            kind,
+            shape,
+            rotation,
+            f.get_tensor(inp) if inp in keys else None,
+        )
+
+    def params(self, dtype):
+        from comfy_kitchen.tensor import (
+            TensorCoreConvRotW4A4Layout,
+            TensorCoreNVFP4Layout,
+        )
+
+        if self.kind == "convrot_w4a4":
+            return TensorCoreConvRotW4A4Layout.Params(
+                scale=self.scale,
+                orig_dtype=dtype,
+                orig_shape=(self.out_features, self.in_features),
+                convrot_groupsize=self.rotation,
+                quant_group_size=64,
+                linear_dtype="int4",
+            )
+        return TensorCoreNVFP4Layout.Params(
+            scale=self.scale2,
+            block_scale=self.scale,
+            orig_dtype=dtype,
+            orig_shape=(self.out_features, self.in_features),
+        )
+
+    def dense(self, dtype):
+        from comfy_kitchen.tensor import (
+            TensorCoreConvRotW4A4Layout,
+            TensorCoreNVFP4Layout,
+        )
+
+        layout = (
+            TensorCoreConvRotW4A4Layout
+            if self.kind == "convrot_w4a4"
+            else TensorCoreNVFP4Layout
+        )
+        return layout.dequantize(self.weight, self.params(dtype))[
+            : self.out_features, : self.in_features
+        ]
+
+    def forward(self, x):
+        from comfy_kitchen.tensor import QuantizedTensor, TensorCoreNVFP4Layout
+
+        eligible = x.is_cuda and x.dtype in (torch.float16, torch.bfloat16)
+        if self.kind == "nvfp4":
+            eligible = eligible and torch.cuda.get_device_capability(x.device) >= (
+                10,
+                0,
+            )
+        if eligible and not self._fallback:
+            try:
+                layout = (
+                    "TensorCoreConvRotW4A4Layout"
+                    if self.kind == "convrot_w4a4"
+                    else "TensorCoreNVFP4Layout"
+                )
+                weight = QuantizedTensor(self.weight, layout, self.params(x.dtype))
+                if self.kind == "nvfp4":
+                    flat = x.reshape(-1, self.in_features)
+                    packed, params = TensorCoreNVFP4Layout.quantize(flat)
+                    out = torch.nn.functional.linear(
+                        QuantizedTensor(packed, layout, params), weight, self.bias
+                    )
+                    self._last_path = "Comfy-Kitchen"
+                    return out.reshape(*x.shape[:-1], self.out_features)
+                result = torch.nn.functional.linear(x, weight, self.bias)
+                self._last_path = "Comfy-Kitchen"
+                return result
+            except (NotImplementedError, RuntimeError) as exc:
+                if isinstance(exc, torch.OutOfMemoryError):
+                    raise
+                self._fallback = True
+                print(f"[Prompt Refiner] {self.kind} per-layer decode fallback: {exc}")
+        self._last_path = "per-layer decode"
+        return torch.nn.functional.linear(x, self.dense(x.dtype), self.bias)
+
+
+class GGUFLinear(torch.nn.Module):
+    """Decode the active packed GGUF layer, optionally permuting hybrid input activations."""
+
+    def __init__(self, weight, input_permutation=None):
         super().__init__()
         self.weight = weight
+        self.register_buffer("input_permutation", input_permutation, persistent=False)
         self.out_features, self.in_features = weight.shape
         self.register_buffer("bias", None, persistent=False)
 
     def forward(self, x):
         from backend.operations_gguf import dequantize_tensor
 
+        if self.input_permutation is not None:
+            x = x.index_select(-1, self.input_permutation)
         weight = (
             dequantize_tensor(self.weight, input=x)
             .as_subclass(torch.Tensor)

@@ -6,12 +6,14 @@ The LLM is the very same text encoder file you already use for image generation
 (e.g. qwen3vl_4b_fp8_scaled.safetensors from models/text_encoder).
 No Ollama / LM Studio / external server is needed.
 
-Supported: text-only Qwen3, Qwen3-VL, and Qwen2.5-VL; safetensors and GGUF.
+Supported: text-only Qwen3, Qwen3-VL, Qwen2.5-VL, and dense Qwen3.5 9B.
+Safetensors and GGUF are accepted; Qwen3.5 supports safetensors and standard llama.cpp GGUF.
 Compressed layouts include scaled FP8, INT8, INT8 ConvRot, and Neo W4A8.
-Qwen3.5, MoE, other model families, and image inputs are not supported.
+MoE, other model families, and image inputs are not supported.
 """
 
 import gc
+import html
 import json
 import os
 import queue
@@ -36,7 +38,8 @@ if str(EXT_DIR) not in sys.path:
 # Forge imports extension scripts without guaranteeing their root is on sys.path.
 from prompt_refiner_lib import checkpoints, models  # noqa: E402
 from prompt_refiner_lib.preferences import SettingsStore  # noqa: E402
-from prompt_refiner_lib.quantization import QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
+from prompt_refiner_lib.lm_heads import KNOWN_HEAD_SOURCES, MissingLMHeadError  # noqa: E402
+from prompt_refiner_lib.quantization import PackedLinear, QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
 
 PRESETS_FILE = EXT_DIR / "presets.json"
 SETTINGS_FILE = EXT_DIR / "settings.json"
@@ -343,7 +346,7 @@ def _create_lm_head(repo_id, as_int8, token):
         wm = json.loads(Path(idx).read_text(encoding="utf-8"))["weight_map"]
         key = next((k for k in wm if k.endswith("lm_head.weight")), None)
         if key is None:
-            raise RuntimeError("This repo has no lm_head.weight (the model ties it to the embeddings) - no file needed.")
+            raise RuntimeError("This repository has no lm_head.weight. Diffusion encoders may omit it: choose the original language model repository. Models with tied embeddings need no separate head.")
         fname = wm[key]
     url = hf_hub_url(repo_id, fname)
 
@@ -397,12 +400,13 @@ def _drain(gen, label):
 
 
 def create_lm_head_ui(repo_id, as_int8, token):
+    """Report setup, network, or file errors beside the download controls, without raising."""
     try:
         yield from _create_lm_head(repo_id, as_int8, token)
-    except gr.Error:
-        raise
-    except Exception as e:
-        raise gr.Error(f"{type(e).__name__}: {e}")
+    except Exception as exc:
+        message = f"LM head download not completed: {exc}"
+        print(f"[Prompt Refiner] {message}", flush=True)
+        yield _bar(0, message), gr.update()
 
 
 def build_model(path, dtype, rope_choice, work_device="cpu", keep_quantized=True, compress=False,
@@ -479,14 +483,14 @@ def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram
 
 
 def _build_chat(system, user, empty_think, tokenizer, family):
-    """Use the selected tokenizer's chat template and limit thinking controls to Qwen3."""
+    """Use the selected tokenizer's chat template and limit thinking controls to switchable Qwen models."""
     messages = []
     if system.strip():
         messages.append({"role": "system", "content": system.strip()})
     messages.append({"role": "user", "content": user.strip()})
-    kwargs = {"enable_thinking": False} if empty_think and family == "Qwen3" else {}
+    kwargs = {"enable_thinking": False} if empty_think and family in ("Qwen3", "Qwen3.5") else {}
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
-    if empty_think and family == "Qwen3" and not text.rstrip().endswith("</think>"):
+    if empty_think and family in ("Qwen3", "Qwen3.5") and not text.rstrip().endswith("</think>"):
         text += "<think>\n\n</think>\n\n"
     return text
 
@@ -542,12 +546,33 @@ def _bar(frac, text, busy=False):
     anim = "animation:prpulse 1.1s ease-in-out infinite;" if busy else ""
     return (
         "<style>@keyframes prpulse{0%,100%{opacity:.35}50%{opacity:1}}</style>"
-        f'<div style="margin:4px 0"><div style="font-size:0.9em;margin-bottom:3px">{text}</div>'
+        f'<div style="margin:4px 0"><div style="font-size:0.9em;margin-bottom:3px">{html.escape(str(text))}</div>'
         '<div style="height:12px;border-radius:6px;overflow:hidden;background:var(--background-fill-secondary);'
         'border:1px solid var(--border-color-primary)">'
         f'<div style="height:100%;width:{pct}%;background:var(--color-accent);transition:width .2s;{anim}"></div>'
         "</div></div>"
     )
+
+
+def _model_storage_bytes(model):
+    """Count unique retained tensor storages, including packed buffers and tied aliases.
+
+    This is the actual loaded weight/buffer footprint, not the checkpoint file size
+    or a logical GGUF shape. It excludes runtime KV/recurrent state and temporaries.
+    CUDA storage remains CUDA-tagged when Windows pages it into shared host memory.
+    """
+    totals = {}
+    seen = set()
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if tensor.is_meta:
+            continue
+        storage = tensor.untyped_storage()
+        identity = (str(tensor.device), storage.data_ptr())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        totals[tensor.device.type] = totals.get(tensor.device.type, 0) + storage.nbytes()
+    return totals
 
 
 def _describe(model, device):
@@ -556,7 +581,14 @@ def _describe(model, device):
     s = f"device {p.device}, {str(p.dtype).replace('torch.', '')}, attention: {getattr(model.config, '_attn_implementation', '?')}"
     nq = getattr(model, "_pr_quant_layers", 0)
     if nq:
-        s += f", {getattr(model, '_pr_w4_layers', 0)} W4A8 layers, {getattr(model, '_pr_gguf_layers', 0)} GGUF layers"
+        s += (f", {getattr(model, '_pr_w4_layers', 0)} W4A8 layers, {getattr(model, '_pr_w6_layers', 0)} W6A8 layers, "
+              f"{getattr(model, '_pr_int4_layers', 0)} INT4 ConvRot layers, {getattr(model, '_pr_nvfp4_layers', 0)} NVFP4 layers, "
+              f"{getattr(model, '_pr_gguf_layers', 0)} GGUF layers")
+        for kind in ("convrot_w4a4", "nvfp4"):
+            paths = {getattr(module, "_last_path", "not used yet") for module in model.modules()
+                     if isinstance(module, PackedLinear) and module.kind == kind}
+            if paths:
+                s += f", {kind}: {', '.join(sorted(paths))}"
         # Report only storage types actually present in this model, not a previous run.
         kinds = {module.weight.dtype for module in model.modules() if isinstance(module, QuantLinear)}
         for dtype in sorted(kinds, key=str):
@@ -565,9 +597,18 @@ def _describe(model, device):
             s += f", {str(dtype).replace('torch.', '')} GEMV: {kernel}"
         if getattr(model, "_pr_gguf_layers", 0):
             s += ", GGUF: per-layer dequantization + PyTorch linear"
+    storage = _model_storage_bytes(model)
+    s += f", loaded weights/buffers {sum(storage.values()) / 1e9:.2f} GB"
     if device == "cuda":
         free, total = torch.cuda.mem_get_info()
-        s += f", GPU {torch.cuda.get_device_name(0)}, VRAM in use {(total - free) / 1e9:.1f}/{total / 1e9:.1f} GB"
+        allocated = torch.cuda.memory_allocated() / 1e9
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        s += (
+            f" (CUDA {storage.get('cuda', 0) / 1e9:.2f} GB, CPU {storage.get('cpu', 0) / 1e9:.2f} GB)"
+            f", GPU {torch.cuda.get_device_name(0)}, physical VRAM in use {(total - free) / 1e9:.1f}/{total / 1e9:.1f} GB"
+            f", PyTorch CUDA allocated {allocated:.2f} GB, peak this run {peak:.2f} GB, reserved {reserved:.2f} GB (process totals)"
+        )
         n_cpu = sum(1 for q in params if q.device.type == "cpu")
         if n_cpu:
             s += f" - WARNING: {n_cpu} weight tensors are still on the CPU"
@@ -597,6 +638,9 @@ def run_refine(
         print(f"[Prompt Refiner] Starting refinement: {encoder_name}", flush=True)
         t0 = time.time()
         try:
+            # Reset before loading so the peak includes model construction and inference.
+            if torch.cuda.is_available() and device_choice != "cpu":
+                torch.cuda.reset_peak_memory_stats()
             cached = _STATE["model"] is not None
             msg = "Preparing selected model..." if cached else "Loading model from file (reading and decoding weights)..."
             yield gr.update(), msg, _bar(None, msg, busy=True)
@@ -700,6 +744,11 @@ def run_refine(
                       f"model load {t_load:.1f}s, seed {seed}.\n{_STATE['info']}; {_describe(model, device)}")
             print(f"[Prompt Refiner] Done{stopped}: {n} tokens in {t_gen:.1f}s ({rate:.1f} tok/s), seed {seed}.", flush=True)
             yield result, status, _bar(1.0, f"Done{stopped} - {n} tokens, {rate:.1f} tok/s")
+        except MissingLMHeadError as exc:
+            message = str(exc)
+            print(f"[Prompt Refiner] Setup needed: {message}", flush=True)
+            unload_model()
+            yield gr.update(), message, ""
         except gr.Error:
             raise
         except Exception as e:
@@ -741,7 +790,7 @@ def on_ui_tabs():
 
     with gr.Blocks(analytics_enabled=False) as ui:
         gr.Markdown(
-            "Rewrite or expand prompts with your Qwen3, Qwen3-VL, or Qwen2.5-VL text encoder (safetensors / GGUF). "
+            "Rewrite or expand prompts with your Qwen3, Qwen3-VL, Qwen2.5-VL, or Qwen3.5 9B text encoder (safetensors / GGUF). "
             "Runs locally inside Forge - no Ollama or LM Studio needed."
         )
         # Keep prompt editing and generation controls visible; uncommon settings
@@ -761,7 +810,7 @@ def on_ui_tabs():
                 preset = gr.Dropdown(label="System prompt preset", choices=preset_names,
                                      value=preset_names[0] if preset_names else None)
                 max_new = gr.Slider(32, 4096, value=768, step=16, label="Max new tokens")
-                empty_think = gr.Checkbox(value=True, label="Disable thinking via chat template (switchable Qwen3 only)",
+                empty_think = gr.Checkbox(value=True, label="Disable thinking via chat template (switchable Qwen3 / Qwen3.5 only)",
                                           info="Dedicated Thinking-2507 checkpoints cannot disable thinking.")
                 with gr.Accordion("System prompt & presets", open=False):
                     system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
@@ -805,18 +854,18 @@ def on_ui_tabs():
             with gr.Row():
                 device = gr.Dropdown(["auto (GPU if available)", "cuda", "cpu"], value="auto (GPU if available)", label="Device")
                 dtype = gr.Dropdown(["auto", "bfloat16", "float16", "float32"], value="auto", label="Compute dtype")
-                rope = gr.Dropdown(["Auto (checkpoint configuration / model profile)", "1,000,000 (Qwen3)", "5,000,000 (Qwen3-VL)"],
+                rope = gr.Dropdown(["Auto (checkpoint configuration / model profile)", "1,000,000 (Qwen3)", "5,000,000 (Qwen3-VL)", "10,000,000 (Qwen3.5)"],
                                    value="Auto (checkpoint configuration / model profile)", label="RoPE theta")
             with gr.Row():
                 keep_loaded = gr.Checkbox(value=False, label="Keep model loaded after generation (uses VRAM!)")
                 free_vram = gr.Checkbox(value=True, label="Unload Forge's image models from VRAM before loading the LLM")
             with gr.Row():
-                keep_q = gr.Checkbox(value=True, label="Keep INT8 / FP8 / W4A8 / GGUF weights compressed (recommended)")
-                compress = gr.Checkbox(value=False, label="Also compress bf16 / fp16 weights to int8 on load (lets 8 GB cards run full-size files; tiny quality loss)")
+                keep_q = gr.Checkbox(value=True, label="Keep supported quantized weights compressed (recommended)")
+                compress = gr.Checkbox(value=False, label="Also compress bf16 / fp16 weights to int8 on load (reduces weight memory; may affect quality)")
 
         with gr.Accordion("LM head (for untied encoders with missing output weights)", open=False):
             gr.Markdown(
-                "Known tied models need no extra weights. Qwen2.5-VL 7B and untied Qwen3/VL encoders need the exact "
+                "Known tied models need no extra weights. Qwen2.5-VL 7B, Qwen3.5 9B, and untied Qwen3/VL encoders need the exact "
                 "`lm_head.weight` tensor from the original model on Hugging Face; it is stored once in "
                 "`models/prompt_refiner/lm_heads/`. Select it explicitly unless its name matches the encoder stem or source metadata matches. "
                 "Matching tensor dimensions alone do not establish compatibility."
@@ -824,6 +873,16 @@ def on_ui_tabs():
             with gr.Row():
                 lm_choice = gr.Dropdown(label="LM head file", choices=["Auto"] + list_lm_heads(), value="Auto", scale=4)
                 lm_refresh = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
+            gr.Markdown(
+                "If refinement reports a missing output head: choose the standard original model below, "
+                "click **Download lm_head**, then refine again with the downloaded file selected. "
+                "For MOSS-Image / Qwen3.5 9B, the standard source is **Qwen/Qwen3.5-9B**. "
+                "Enter a repository ID as `owner/model` (for example, `Qwen/Qwen3.5-9B`), "
+                "not a web page URL or a diffusion model repository. For custom/fine-tuned encoders, "
+                "enter the exact original checkpoint repository. Suggestions do not establish compatibility."
+            )
+            lm_source = gr.Dropdown(label="Known original model source", choices=list(KNOWN_HEAD_SOURCES),
+                                    value=next(iter(KNOWN_HEAD_SOURCES)))
             with gr.Row():
                 lm_repo = gr.Textbox(label="Hugging Face repo of the ORIGINAL model", placeholder="Qwen/Qwen3.5-9B", scale=4)
                 lm_token = gr.Textbox(label="HF token (only for gated repos)", type="password", scale=2)
@@ -858,6 +917,7 @@ def on_ui_tabs():
             control.value = settings.values[key]
         system_prompt.value = presets.get(preset.value, "")
         preset_name.value = preset.value or ""
+        lm_source.value = next((name for name, repo in KNOWN_HEAD_SOURCES.items() if repo == lm_repo.value), next(iter(KNOWN_HEAD_SOURCES)))
         settings_status = gr.Textbox(label="Settings status", value=settings.message,
                                      visible=bool(settings.message), interactive=False)
 
@@ -879,6 +939,9 @@ def on_ui_tabs():
         refresh_btn.click(_refresh, inputs=[encoder], outputs=[encoder])
         lm_refresh.click(lambda cur: gr.update(choices=["Auto"] + list_lm_heads(), value=cur),
                          inputs=[lm_choice], outputs=[lm_choice])
+        lm_source.input(lambda name: KNOWN_HEAD_SOURCES.get(name, ""), inputs=[lm_source], outputs=[lm_repo])
+        lm_repo.input(lambda repo: next((name for name, value in KNOWN_HEAD_SOURCES.items() if value == repo), next(iter(KNOWN_HEAD_SOURCES))),
+                      inputs=[lm_repo], outputs=[lm_source])
         lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_int8, lm_token], outputs=[lm_status, lm_choice],
                      show_progress="hidden")
 

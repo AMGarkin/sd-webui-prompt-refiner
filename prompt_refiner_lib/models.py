@@ -2,7 +2,8 @@
 
 For text-only input, all three MRoPE axes have the same positions. Qwen3-VL's
 language weights therefore use Qwen3ForCausalLM; Qwen2.5-VL uses Qwen2ForCausalLM
-with biased Q/K/V projections. Neither path allocates a vision tower.
+with biased Q/K/V projections. Qwen3.5 uses a separate cached hybrid decoder.
+No path allocates a vision tower.
 """
 
 import re
@@ -11,17 +12,23 @@ from pathlib import Path
 import torch
 
 from .checkpoints import open_checkpoint, read_config
+from .lm_heads import MissingLMHeadError
 from .quantization import (
     GGUFLinear,
     QuantLinear,
+    PackedLinear,
+    W4A8Linear,
+    packed_shape,
     _dequantize,
     _load_quantized,
     _read_comfy_quant,
     _requantize_rows,
 )
 
-FAMILIES = ["Auto", "Qwen3", "Qwen3-VL", "Qwen2.5-VL"]
+FAMILIES = ["Auto", "Qwen3", "Qwen3-VL", "Qwen2.5-VL", "Qwen3.5"]
 MODEL_TYPES = {
+    "qwen3_5": "Qwen3.5",
+    "qwen3_5_text": "Qwen3.5",
     "qwen3": "Qwen3",
     "qwen3_vl": "Qwen3-VL",
     "qwen3_vl_text": "Qwen3-VL",
@@ -54,13 +61,199 @@ def logical_shape(f, keys, key):
     shape = tuple(f.get_slice(key).get_shape())
     if not getattr(f, "is_gguf", False) and key.endswith(".weight"):
         info = _read_comfy_quant(f, keys, key[: -len(".weight")])
-        if info and info["format"] == "asym_w4a8_int8":
-            relative = key + "_s_rel"
-            if relative not in keys:
-                raise ValueError(f"Missing W4A8 group scales: {relative}")
-            rows, groups = f.get_slice(relative).get_shape()
-            return rows, groups * int(info.get("group_size", 16))
+        if info and info["format"] in (
+            "asym_w4a8_int8",
+            "w6a8_int8",
+            "convrot_w4a4",
+            "nvfp4",
+        ):
+            return packed_shape(f, keys, key, info)
     return shape
+
+
+def qwen35_profile(f, path, family="Auto"):
+    """Infer the dense MOSS 9B hybrid profile and validate any explicit text config."""
+    if family not in ("Auto", "Qwen3.5"):
+        raise ValueError(
+            "Hybrid Qwen3.5 weights conflict with the selected model family."
+        )
+    metadata = f.metadata() or {}
+    gguf = getattr(f, "is_gguf", False)
+    if gguf and metadata.get("general.architecture") != "qwen35":
+        raise ValueError("This GGUF does not describe dense Qwen3.5.")
+    if metadata.get("qwen35.rope.scaling.type", "none") not in ("none", "default", ""):
+        raise ValueError("Non-default Qwen3.5 GGUF RoPE scaling is not supported.")
+    keys = set(f.keys())
+    config = read_config(path)
+    text = dict(config.get("text_config", config))
+    model_type = config.get("model_type", text.get("model_type"))
+    if model_type and model_type not in ("qwen3_5", "qwen3_5_text"):
+        raise ValueError("The adjacent configuration does not describe dense Qwen3.5.")
+    anchors = [k for k in keys if k.endswith("layers.0.linear_attn.in_proj_qkv.weight")]
+    if len(anchors) != 1:
+        raise ValueError("Qwen3.5 requires a supported linear-attention first layer.")
+    prefix = anchors[0][: -len("layers.0.linear_attn.in_proj_qkv.weight")]
+
+    def shape(name):
+        return logical_shape(f, keys, prefix + name)
+
+    vocab, hidden = shape("embed_tokens.weight")
+    layers = sorted(
+        {
+            int(m.group(1))
+            for key in keys
+            if key.startswith(prefix)
+            for m in [re.match(r"layers\.(\d+)\.", key[len(prefix) :])]
+            if m
+        }
+    )
+    if layers != list(range(len(layers))) or not layers:
+        raise ValueError(
+            "Qwen3.5 language layers must be contiguous and start at zero."
+        )
+    kinds = []
+    for i in layers:
+        linear = prefix + f"layers.{i}.linear_attn.in_proj_qkv.weight" in keys
+        full = prefix + f"layers.{i}.self_attn.q_proj.weight" in keys
+        if linear == full:
+            raise ValueError(f"Invalid Qwen3.5 attention type in layer {i}.")
+        kinds.append("linear_attention" if linear else "full_attention")
+    if "full_attention" not in kinds:
+        raise ValueError("Qwen3.5 needs at least one full-attention layer.")
+    first = kinds.index("full_attention")
+    head_dim = shape(f"layers.{first}.self_attn.q_norm.weight")[0]
+    qsize = shape(f"layers.{first}.self_attn.q_proj.weight")[0]
+    ksize = shape(f"layers.{first}.self_attn.k_proj.weight")[0]
+    if qsize % (2 * head_dim) or ksize % head_dim:
+        raise ValueError("Invalid Qwen3.5 gated query/key dimensions.")
+    intermediate = shape("layers.0.mlp.gate_proj.weight")[0]
+    conv_shape = shape("layers.0.linear_attn.conv1d.weight")
+    vheads = shape("layers.0.linear_attn.in_proj_a.weight")[0]
+    vdim = shape("layers.0.linear_attn.norm.weight")[0]
+    kdim = int(
+        text.get("linear_key_head_dim", metadata.get("qwen35.ssm.state_size", 128))
+    )
+    ktotal = conv_shape[0] - vheads * vdim
+    if len(conv_shape) != 3 or conv_shape[1] != 1 or ktotal <= 0 or ktotal % (2 * kdim):
+        raise ValueError("Invalid Qwen3.5 causal convolution/key-head dimensions.")
+    kheads = ktotal // (2 * kdim)
+    expected = dict(
+        vocab_size=vocab,
+        hidden_size=hidden,
+        num_hidden_layers=len(layers),
+        intermediate_size=intermediate,
+        num_attention_heads=qsize // (2 * head_dim),
+        num_key_value_heads=ksize // head_dim,
+        head_dim=head_dim,
+        linear_num_key_heads=kheads,
+        linear_num_value_heads=vheads,
+        linear_key_head_dim=kdim,
+        linear_value_head_dim=vdim,
+        linear_conv_kernel_dim=conv_shape[-1],
+        layer_types=kinds,
+    )
+    if gguf:
+        for suffix, value in (
+            ("ssm.group_count", kheads),
+            ("ssm.time_step_rank", vheads),
+            ("ssm.inner_size", vheads * vdim),
+            ("ssm.state_size", kdim),
+            ("ssm.conv_kernel", conv_shape[-1]),
+        ):
+            if (
+                "qwen35." + suffix in metadata
+                and int(metadata["qwen35." + suffix]) != value
+            ):
+                raise ValueError(
+                    f"Qwen3.5 GGUF metadata {suffix} conflicts with tensor dimensions."
+                )
+    known = (
+        vocab,
+        hidden,
+        len(layers),
+        intermediate,
+        expected["num_attention_heads"],
+        expected["num_key_value_heads"],
+        head_dim,
+        kheads,
+        vheads,
+        kdim,
+        vdim,
+        conv_shape[-1],
+    ) == (248320, 4096, 32, 12288, 16, 4, 256, 16, 32, 128, 128, 4)
+    if not known and not (model_type and all(key in text for key in expected)):
+        raise ValueError(
+            "Only the dense Qwen3.5 9B profile is automatic; supply its complete original text config for other dimensions."
+        )
+    for key, value in expected.items():
+        if key in text and text[key] != value:
+            raise ValueError(
+                f"Configuration {key} conflicts with Qwen3.5 checkpoint dimensions."
+            )
+    if (
+        expected["num_attention_heads"] % expected["num_key_value_heads"]
+        or vheads % kheads
+    ):
+        raise ValueError("Invalid Qwen3.5 grouped attention head counts.")
+    if known and kinds != [
+        "full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in layers
+    ]:
+        raise ValueError("Qwen3.5 9B requires full attention every fourth layer.")
+    if text.get("attention_bias", False) or not text.get("attn_output_gate", True):
+        raise ValueError("Unsupported Qwen3.5 attention bias/gate configuration.")
+    if text.get("hidden_act", "silu") != "silu" or text.get(
+        "use_sliding_window", False
+    ):
+        raise ValueError(
+            "Unsupported Qwen3.5 activation or sliding-window configuration."
+        )
+    rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
+    if rope.get("rope_type", rope.get("type", "default")) != "default":
+        raise ValueError("Non-default Qwen3.5 RoPE scaling is not supported.")
+    partial = float(
+        rope.get(
+            "partial_rotary_factor",
+            text.get(
+                "partial_rotary_factor",
+                float(metadata.get("qwen35.rope.dimension_count", head_dim * 0.25))
+                / head_dim,
+            ),
+        )
+    )
+    rotary = int(head_dim * partial)
+    if not 0 < partial <= 1 or rotary < 2 or rotary % 2:
+        raise ValueError("Invalid Qwen3.5 partial rotary dimension.")
+    tied = text.get("tie_word_embeddings", config.get("tie_word_embeddings", False))
+    if tied is not False:
+        raise ValueError("Dense Qwen3.5 requires its separate original output head.")
+    return {
+        **expected,
+        "family": "Qwen3.5",
+        "prefix": prefix,
+        "tied": False,
+        "rope_theta": float(
+            rope.get(
+                "rope_theta",
+                text.get(
+                    "rope_theta", metadata.get("qwen35.rope.freq_base", 10000000.0)
+                ),
+            )
+        ),
+        "partial_rotary_factor": partial,
+        "max_position_embeddings": int(
+            text.get(
+                "max_position_embeddings", metadata.get("qwen35.context_length", 262144)
+            )
+        ),
+        "rms_norm_eps": float(
+            text.get(
+                "rms_norm_eps",
+                metadata.get("qwen35.attention.layer_norm_rms_epsilon", 1e-6),
+            )
+        ),
+        "hidden_act": "silu",
+        "source": config.get("_name_or_path", (f.metadata() or {}).get("source", "")),
+    }
 
 
 def profile(f, path, family="Auto"):
@@ -68,10 +261,10 @@ def profile(f, path, family="Auto"):
     if family not in FAMILIES:
         raise ValueError(f"Unknown model family: {family}")
     keys = set(f.keys())
-    if any("linear_attn." in key or ".experts." in key for key in keys):
-        raise ValueError(
-            "Qwen3.5 and mixture-of-experts encoders are not supported in this version."
-        )
+    if any(".experts." in key for key in keys):
+        raise ValueError("Mixture-of-experts encoders are not supported.")
+    if any("linear_attn." in key for key in keys) or family == "Qwen3.5":
+        return qwen35_profile(f, path, family)
     anchor = next(
         (k for k in keys if k.endswith("layers.0.self_attn.q_proj.weight")), None
     )
@@ -246,9 +439,12 @@ def inspect_profile(path, family="Auto"):
 def find_tokenizer(path, resolved, forge_root, extension_dir, override=""):
     """Choose family-specific local tokenizer assets, with an explicit override first."""
     family = resolved["family"]
-    slug = {"Qwen3": "qwen3", "Qwen3-VL": "qwen3_vl", "Qwen2.5-VL": "qwen2_5_vl"}[
-        family
-    ]
+    slug = {
+        "Qwen3": "qwen3",
+        "Qwen3-VL": "qwen3_vl",
+        "Qwen2.5-VL": "qwen2_5_vl",
+        "Qwen3.5": "qwen3_5",
+    }[family]
     path, extension_dir, forge_root = Path(path), Path(extension_dir), Path(forge_root)
     if override.strip():
         candidates = [Path(override.strip()).expanduser()]
@@ -267,6 +463,7 @@ def find_tokenizer(path, resolved, forge_root, extension_dir, override=""):
             ],
             "Qwen3-VL": ["krea/Krea-2-Raw", "Qwen/Qwen-Image-2.1"],
             "Qwen2.5-VL": ["Qwen/Qwen-Image"],
+            "Qwen3.5": ["OpenMOSS-Team/MOSS-Image-SFT"],
         }[family]
         # Preserve the source tokenizer's chat template when the encoder identifies
         # its Neo integration. Vocabulary compatibility alone does not select a template.
@@ -294,7 +491,12 @@ def load_tokenizer(path, resolved):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
-    for token, expected in (("<|im_start|>", 151644), ("<|im_end|>", 151645)):
+    special = (
+        (("<|im_start|>", 248045), ("<|im_end|>", 248046))
+        if resolved["family"] == "Qwen3.5"
+        else (("<|im_start|>", 151644), ("<|im_end|>", 151645))
+    )
+    for token, expected in special:
         if tokenizer.convert_tokens_to_ids(token) != expected:
             raise ValueError(
                 f"Tokenizer has an incompatible {token} ID; select the matching {resolved['family']} tokenizer."
@@ -338,51 +540,68 @@ def build_model(
         keys = set(f.keys())
         prefix = p["prefix"]
         theta = p["rope_theta"]
-        if rope_choice.startswith("1"):
+        if rope_choice.startswith("10,000,000"):
+            theta = 10_000_000.0
+        elif rope_choice.startswith("1"):
             theta = 1_000_000.0
         elif rope_choice.startswith("5"):
             theta = 5_000_000.0
-        qwen2 = p["family"] == "Qwen2.5-VL"
-        config_cls, model_cls = (
-            (Qwen2Config, Qwen2ForCausalLM)
-            if qwen2
-            else (Qwen3Config, Qwen3ForCausalLM)
-        )
-        config = config_cls(
-            **{
-                key: p[key]
-                for key in (
-                    "vocab_size",
-                    "hidden_size",
-                    "intermediate_size",
-                    "num_hidden_layers",
-                    "num_attention_heads",
-                    "num_key_value_heads",
-                    "head_dim",
-                    "max_position_embeddings",
-                    "rms_norm_eps",
-                    "hidden_act",
-                )
-            },
-            rope_theta=theta,
-            tie_word_embeddings=p["tied"],
-            attention_bias=qwen2,
-            use_sliding_window=False,
-        )
-        config._attn_implementation = "sdpa"
-        if isinstance(getattr(config, "rope_parameters", None), dict):
-            config.rope_parameters["rope_theta"] = theta
-        with torch.device("meta"):
-            model = model_cls(config)
-        if qwen2:
-            from transformers.models.qwen2.modeling_qwen2 import (
-                Qwen2RotaryEmbedding as Rotary,
-            )
+        qwen35 = p["family"] == "Qwen3.5"
+        if qwen35:
+            from .qwen35 import Qwen35Config, Qwen35ForCausalLM
+
+            fields = {
+                key: value
+                for key, value in p.items()
+                if key not in ("family", "prefix", "tied", "source")
+            }
+            fields["rope_theta"] = theta
+            config = Qwen35Config(**fields)
+            config._attn_implementation = "sdpa"
+            with torch.device("meta"):
+                model = Qwen35ForCausalLM(config)
         else:
-            from transformers.models.qwen3.modeling_qwen3 import (
-                Qwen3RotaryEmbedding as Rotary,
+            qwen2 = p["family"] == "Qwen2.5-VL"
+            config_cls, model_cls = (
+                (Qwen2Config, Qwen2ForCausalLM)
+                if qwen2
+                else (Qwen3Config, Qwen3ForCausalLM)
             )
-        model.model.rotary_emb = Rotary(config=config, device="cpu")
+            config = config_cls(
+                **{
+                    key: p[key]
+                    for key in (
+                        "vocab_size",
+                        "hidden_size",
+                        "intermediate_size",
+                        "num_hidden_layers",
+                        "num_attention_heads",
+                        "num_key_value_heads",
+                        "head_dim",
+                        "max_position_embeddings",
+                        "rms_norm_eps",
+                        "hidden_act",
+                    )
+                },
+                rope_theta=theta,
+                tie_word_embeddings=p["tied"],
+                attention_bias=qwen2,
+                use_sliding_window=False,
+            )
+            config._attn_implementation = "sdpa"
+            if isinstance(getattr(config, "rope_parameters", None), dict):
+                config.rope_parameters["rope_theta"] = theta
+            with torch.device("meta"):
+                model = model_cls(config)
+            if qwen2:
+                from transformers.models.qwen2.modeling_qwen2 import (
+                    Qwen2RotaryEmbedding as Rotary,
+                )
+            else:
+                from transformers.models.qwen3.modeling_qwen3 import (
+                    Qwen3RotaryEmbedding as Rotary,
+                )
+            model.model.rotary_emb = Rotary(config=config, device="cpu")
 
         heads = [k for k in keys if k.endswith("lm_head.weight")]
         if len(heads) > 1:
@@ -394,16 +613,21 @@ def build_model(
                 lm_choice, Path(path), p["vocab_size"], p["hidden_size"], p
             )
         if head is None and sidecar is None and not p["tied"]:
-            raise ValueError(
-                f"{p['family']} requires its original lm_head.weight. Select an exact matching LM head or download it in the LM head section."
-            )
+            raise MissingLMHeadError(p["family"])
 
         state, replacements = {}, {}
         gguf_count, w4_count, requant_count = 0, 0, 0
+        w6_count, int4_count, nvfp4_count = 0, 0, 0
 
         def load_weight(source, source_keys, key, target):
             """Load one expected weight, preserving supported quantized linears."""
-            nonlocal gguf_count, w4_count, requant_count
+            nonlocal \
+                gguf_count, \
+                w4_count, \
+                requant_count, \
+                w6_count, \
+                int4_count, \
+                nvfp4_count
             module_name = target[: -len(".weight")]
             module = model.get_submodule(module_name)
             shape = logical_shape(source, source_keys, key)
@@ -415,7 +639,8 @@ def build_model(
                 if getattr(source, "is_gguf", False):
                     packed = source.packed(key, dtype)
                     if packed is not None:
-                        replacements[module_name] = GGUFLinear(packed)
+                        permutation = getattr(source, "input_permutations", {}).get(key)
+                        replacements[module_name] = GGUFLinear(packed, permutation)
                         gguf_count += 1
                         return
                     if compress:
@@ -427,7 +652,16 @@ def build_model(
                     quant = _load_quantized(source, source_keys, key)
                     if isinstance(quant, torch.nn.Module):
                         replacements[module_name] = quant
-                        w4_count += 1
+                        if isinstance(quant, W4A8Linear):
+                            if quant.bits == 6:
+                                w6_count += 1
+                            else:
+                                w4_count += 1
+                        elif isinstance(quant, PackedLinear):
+                            if quant.kind == "nvfp4":
+                                nvfp4_count += 1
+                            else:
+                                int4_count += 1
                         return
                     if quant is None:
                         small = source.get_slice(key).get_dtype() in (
@@ -447,10 +681,24 @@ def build_model(
                         replacements[module_name] = QuantLinear(*quant)
                         return
             if getattr(source, "is_gguf", False):
-                state[target] = source.get_tensor(key).to(dtype)
+                target_dtype = (
+                    torch.float32
+                    if qwen35
+                    and not isinstance(module, torch.nn.Linear)
+                    and source.get_slice(key).get_dtype() == "F32"
+                    else dtype
+                )
+                state[target] = source.get_tensor(key).to(target_dtype)
             else:
+                target_dtype = (
+                    torch.float32
+                    if qwen35
+                    and not isinstance(module, torch.nn.Linear)
+                    and source.get_slice(key).get_dtype() == "F32"
+                    else dtype
+                )
                 state[target] = _dequantize(
-                    source, source_keys, key, dtype, work_device
+                    source, source_keys, key, target_dtype, work_device
                 )
 
         expected = model.state_dict()
@@ -466,7 +714,9 @@ def build_model(
                 tensor = f.get_tensor(key)
                 if tuple(tensor.shape) != tuple(expected[target].shape):
                     raise ValueError(f"Bias shape mismatch: {key}")
-                state[target] = tensor.to(dtype)
+                state[target] = tensor.to(
+                    torch.float32 if qwen35 and target.endswith(".A_log") else dtype
+                )
         if sidecar:
             with open_checkpoint(sidecar) as sf:
                 load_weight(sf, set(sf.keys()), "lm_head.weight", "lm_head.weight")
@@ -491,6 +741,7 @@ def build_model(
             ".weight_s_channel",
             ".weight_codebook",
             ".weight_correction",
+            ".pre_quant_scale",
         )
         extras = [
             k
@@ -526,13 +777,23 @@ def build_model(
     model.eval()
     model._pr_quant_layers = len(replacements)
     model._pr_gguf_layers, model._pr_w4_layers = gguf_count, w4_count
+    model._pr_w6_layers, model._pr_int4_layers, model._pr_nvfp4_layers = (
+        w6_count,
+        int4_count,
+        nvfp4_count,
+    )
     model._pr_profile = p
     info = (
         f"{p['family']}, {p['num_hidden_layers']} layers, hidden {p['hidden_size']}, "
         f"RoPE {theta:g}; {len(replacements)} compressed layers "
-        f"({w4_count} W4A8, {gguf_count} GGUF, {requant_count} converted to INT8); "
+        f"({w4_count} W4A8, {w6_count} W6A8, {int4_count} INT4 ConvRot, {nvfp4_count} NVFP4, {gguf_count} GGUF, {requant_count} converted to INT8); "
         f"output head: {Path(sidecar).name if sidecar else ('tied embeddings' if tied else 'checkpoint')}"
     )
+    if qwen35:
+        info += (
+            f"; hybrid attention: {p['layer_types'].count('linear_attention')} linear / "
+            f"{p['layer_types'].count('full_attention')} full; recurrent state: FP32; vision/MTP skipped"
+        )
     if re.search(r"(?:^|[_ .-])base(?:$|[_ .-])", Path(path).stem.lower()):
         info += (
             "; WARNING: base checkpoint, not instruction-tuned; chat instructions "

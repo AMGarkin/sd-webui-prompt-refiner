@@ -134,10 +134,16 @@ class GGUFCheckpoint:
             raise ValueError(
                 "Split GGUF checkpoints must be merged into one GGUF file before use."
             )
-        if arch not in ("qwen3", "qwen3vl", "qwen2vl"):
+        if arch not in ("qwen3", "qwen3vl", "qwen2vl", "qwen35"):
             raise ValueError(
-                f"Unsupported GGUF architecture '{arch}'. Supported: qwen3, qwen3vl, qwen2vl."
+                f"Unsupported GGUF architecture '{arch}'. Supported: qwen3, qwen3vl, qwen2vl, qwen35."
             )
+        self.is_qwen35 = arch == "qwen35"
+        if self.is_qwen35:
+            from .gguf_qwen35 import configure
+
+            configure(self)
+            return
         self.tensors = {}
         for tensor in self.reader.tensors:
             name = gguf_name(tensor.name)
@@ -165,6 +171,10 @@ class GGUFCheckpoint:
         return self.info
 
     def shape(self, key):
+        if self.is_qwen35:
+            from .gguf_qwen35 import shape
+
+            return shape(self, key)
         return tuple(int(v) for v in reversed(self.tensors[key].shape))
 
     def get_slice(self, key):
@@ -181,7 +191,12 @@ class GGUFCheckpoint:
             return None
         if kind not in QUANTS_MAPPING:
             raise ValueError(f"Unsupported GGUF quantization {kind.name} in {key}.")
-        raw = torch.from_numpy(tensor.data.copy())
+        if self.is_qwen35:
+            from .gguf_qwen35 import raw_rows
+
+            raw = torch.from_numpy(raw_rows(self, key).copy())
+        else:
+            raw = torch.from_numpy(tensor.data.copy())
         weight = ParameterGGUF(
             raw, tensor_type=kind, tensor_shape=torch.Size(self.shape(key))
         )
@@ -195,6 +210,10 @@ class GGUFCheckpoint:
         """Decode dense embeddings/norms on CPU using the unmodified GGUF layout."""
         import gguf
 
+        if self.is_qwen35:
+            from .gguf_qwen35 import dense
+
+            return dense(self, key)
         tensor = self.tensors[key]
         array = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
         return torch.from_numpy(array.copy()).reshape(self.shape(key))
@@ -227,12 +246,26 @@ def read_config(path):
 
 
 def is_supported(path):
-    """Inspect headers only; do not accept Qwen3.5, MoE, CLIP, or T5 weights."""
+    """Inspect headers only; recognize dense Qwen hybrid weights and reject MoE."""
     try:
         with open_checkpoint(path) as checkpoint:
             keys = set(checkpoint.keys())
-            if any("linear_attn." in k or ".experts." in k for k in keys):
+            if any(".experts." in k for k in keys):
                 return False
+            hybrid = next(
+                (
+                    k
+                    for k in keys
+                    if k.endswith("layers.0.linear_attn.in_proj_qkv.weight")
+                ),
+                None,
+            )
+            if hybrid:
+                prefix = hybrid[: -len("layers.0.linear_attn.in_proj_qkv.weight")]
+                return (
+                    prefix + "embed_tokens.weight" in keys
+                    and prefix + "layers.3.self_attn.q_proj.weight" in keys
+                )
             anchor = next(
                 (k for k in keys if k.endswith("layers.0.self_attn.q_proj.weight")),
                 None,
