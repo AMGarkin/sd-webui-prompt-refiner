@@ -47,6 +47,54 @@ actual model and weight layout. See the [technical reference](docs/TECHNICAL.md)
 for exact formats, setup requirements, and testing coverage. MoE, CLIP, T5/UMT5,
 and other model families are not supported.
 
+## Sampling recommendations
+
+The default targets **Qwen3-VL 4B Instruct / Krea 2**: preserve the idea's explicit
+subjects, actions, colors, and other constraints while adding compatible details.
+Its temperature, top-p, top-k, repetition penalty, and **presence penalty 1.5**
+follow the model card's [VL recommendations](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct#vl).
+Min-p starts disabled. These are starting points, not a
+quality guarantee; use the natural-language system preset and review the result.
+
+| Model / use | Temperature | Top-p | Top-k | Min-p | Repetition penalty | Presence penalty |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Qwen3-VL 4B Instruct: balanced expansion (default)** | **0.7** | **0.8** | **20** | **0** | **1.0** | **1.5** |
+| Qwen3-VL Instruct: optional broader text profile | 1.0 | 1.0 | 40 | 0 | 1.0 | 2.0 |
+| Qwen3: thinking disabled | 0.7 | 0.8 | 20 | 0 | 1.0 | 0 |
+| Qwen3: thinking enabled | 0.6 | 0.95 | 20 | 0 | 1.0 | 0 |
+| Qwen3.5 9B: thinking disabled | 0.7 | 0.8 | 20 | 0 | 1.0 | 1.5 |
+| Qwen3.5 9B: thinking enabled | 1.0 | 0.95 | 20 | 0 | 1.0 | 1.5 |
+| Qwen2.5-VL 7B Instruct: conservative rewrite | 0 (greedy) | ignored | ignored | ignored | 1.05 | 0 |
+
+The optional Qwen3-VL text profile and Qwen3/Qwen3.5 modes follow their model-card
+recommendations: [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct#text),
+[Qwen3](https://huggingface.co/Qwen/Qwen3-4B#best-practices), and
+[Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-9B#best-practices).
+The Qwen2.5-VL row uses greedy decoding as a practical equivalent to its original
+[near-zero temperature](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/generation_config.json).
+The broader text profile is an alternative to try, not the default for preserving an idea.
+
+For the default profile, try temperature **0.4-0.6** for a more restrained rewrite
+or **0.8-0.9** for more variety. Leave the other values fixed while comparing.
+Presence penalty discourages reusing tokens already generated; it excludes your
+idea and system instructions and is applied once per token, not per occurrence.
+The default **1.5** discourages repetition, including repeated endings in longer
+descriptions such as MOSS prompts. If the output becomes too varied or avoids
+necessary wording, lower it to **0.2-0.5**, or use **0** to disable it. It does not
+guarantee that every repetition loop is prevented.
+Repetition penalty above **1.0** also penalizes input tokens; try **1.03-1.05** only
+if needed. Neither penalty guarantees that the model preserves the input's meaning.
+
+**Temperature 0** selects greedy decoding and ignores top-p/top-k/min-p; both
+penalties still apply. Keep **Seed -1** for variation, or use a fixed seed when
+comparing settings. **Disable thinking** remains checked by default. Thinking
+profiles need that checkbox cleared and may need a higher **Max new tokens** limit.
+
+Existing saved values remain in effect. Open **Sampling options** and click
+**Use Qwen3-VL defaults** to apply and save the six default sampling values; this
+keeps your seed and other options. Profiles are set manually: selecting an encoder
+does not replace your choices or automatically import a `generation_config.json`.
+
 ## What to expect
 
 - **Results depend on the encoder and instructions.** Instruct models usually suit
@@ -63,10 +111,14 @@ and other model families are not supported.
   CPU inference is available. AMD/ROCm is untested.
 - **Models unload after refinement by default.** Enable **Keep model loaded** for
   repeated use if you have enough memory. **Model details** shows diagnostics and
-  provides a manual unload button. Increase **Max new tokens** if output is cut short.
+  provides a manual unload button. Failed runs always release the refiner's model
+  and temporary tensors, even with **Keep model loaded** enabled.
+  Increase **Max new tokens** if output is cut short.
 
 For tokenizer overrides, missing heads, memory troubleshooting, or choosing a
 quantization, read the [technical reference](docs/TECHNICAL.md).
+An unknown model signature is reported in **Status** and a short console message
+without a traceback; supply the matching original HF config as described there.
 
 ## Uninstall
 

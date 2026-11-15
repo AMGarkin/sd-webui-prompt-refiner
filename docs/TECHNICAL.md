@@ -11,6 +11,7 @@ model variant, or GPU backend has been tested end to end.
 - [Hardware and quantization choices](#hardware-and-quantization-choices)
 - [Dependencies](#dependencies)
 - [Controls, settings, and presets](#controls-settings-and-presets)
+- [Sampling and presence penalty](#sampling-and-presence-penalty)
 - [Qwen3.5 / MOSS-Image](#qwen35-9b--moss-image)
 - [Architecture configuration and tokenizers](#architecture-configuration-and-tokenizers)
 - [Safetensors formats](#safetensors-formats-and-memory)
@@ -126,6 +127,11 @@ to reset preferences.
 
 The model is unloaded after each run by default. **Keep model loaded** avoids
 reloading at the cost of occupied memory. **Unload model** releases it manually.
+After a loading or generation error, the refiner always unloads, including when
+**Keep model loaded** is enabled. It stops and joins any active generation worker,
+releases input/model references, and clears failed traceback frames before garbage
+collection and returning unused CUDA cache. Other Forge models and GPU programs
+can still occupy VRAM; this releases the failed refiner run's allocations.
 Loading from disk is reported whenever needed; retaining a model only avoids
 reloading when the selected encoder and model settings still match.
 Presets are editable in the UI and saved in `presets.json`. Selecting a preset
@@ -141,6 +147,30 @@ replaced with defaults. Both files are inside the extension folder.
 An empty prompt or missing encoder produces a status message without loading a
 model or raising an exception. The console logs skipped requests, the start of
 refinement, completion/stopping, and failures; prompt text is not logged.
+
+### Sampling and presence penalty
+
+See the [README sampling table](../README.md#sampling-recommendations) for profiles.
+New installations use the Qwen3-VL 4B Instruct VL model-card values, including
+presence penalty 1.5, with min-p disabled. Existing settings are preserved; the reset
+button changes only the six sampling controls, whose change handlers persist them.
+Model selection does not import a generation config or apply another profile.
+
+The presence control is implemented as an additive Transformers logits processor
+because Forge's Transformers 4.x runtime does not provide that generation option.
+For each sequence, it subtracts the selected value from each token ID appearing
+anywhere after the complete encoded prompt prefix, once regardless of frequency.
+System instructions, the user's idea, and the chat-template prefix are excluded.
+It works with both cached and uncached generation and with greedy or sampled
+selection; it preserves the score dtype and does not modify scores in place.
+This is a token-level penalty, not a detector for repeated phrases or concepts.
+
+The generation request explicitly overrides temperature, top-p, top-k, min-p,
+and repetition penalty. Disabled filters cannot be restored from model defaults.
+At temperature zero, top-p/top-k/min-p are ignored; repetition and presence
+penalties remain active. Presence penalty is saved in `settings.json` like the
+other sampling controls and defaults to 1.5 when older settings omit it. Explicitly
+saved values, including zero, are preserved.
 
 ## Qwen3.5 9B / MOSS-Image
 
@@ -171,6 +201,9 @@ INT4 ConvRot, and NVFP4 linear weights use the validated storage adapters. The s
 parameters must use a supported dense layout. Vision and MTP (multi-token prediction)
 weights, if present, are skipped. Standard llama.cpp Qwen3.5 GGUF exports use
 the hybrid mapping described below.
+Embeddings and convolution weights use the selected compute dtype, including when
+GGUF stores them as FP32. FP32 normalization weights are retained where present,
+and recurrent updates still use FP32 with BF16/FP16 activations.
 
 The official `OpenMOSS-Team/MOSS-Image-SFT/text_encoder` index contains four
 safetensors shards with the `language_model.` prefix and no `lm_head` tensor.
@@ -206,7 +239,10 @@ For a renamed checkpoint or a configuration outside the known profiles, place it
 original HF config beside it as `<encoder-stem>.config.json`; a neighboring
 `config.json` is also accepted. Complete VL configs containing `text_config` work.
 The config must match the tensors and specify `tie_word_embeddings` for unknown
-profiles. Non-default RoPE scaling, sliding-window attention, and unsupported hybrid layouts
+profiles. An unknown signature is treated as a setup issue: **Status** and a short
+console line show the required config, without a traceback. The existing result
+is preserved, and model resources are released even with **Keep model loaded** enabled.
+Non-default RoPE scaling, sliding-window attention, and unsupported hybrid layouts
 are rejected rather than silently ignored. Qwen3.5 uses its own validated hybrid path.
 
 Tokenizer files are loaded locally; no tokenizer is downloaded automatically.
@@ -321,11 +357,17 @@ mapping and have not all been validated here; unsupported types fail explicitly.
 
 Validation covers small full causal models for W6A8, INT4 ConvRot and NVFP4,
 CPU/GPU linear paths, and Qwen3.5 GGUF logits/cached generation with both split
-and merged projections. An actual MiniMax-H3 INT4 ConvRot K projection was also
+and merged projections in FP32/BF16/FP16 on CPU and CUDA. Error-handling tests
+check that failed loading and generation release model/temporary tensors before
+emptying CUDA cache, including chained exceptions and **Keep model loaded**.
+An actual MiniMax-H3 INT4 ConvRot K projection was also
 loaded and executed on CPU and RTX 4060. Full generation also passed with the
 real `qwen3_vl_4b_nvfp4_full.safetensors` encoder on RTX 4060, using per-layer
-NVFP4 decoding. Full production W6A8 encoders, Blackwell-native NVFP4, and a
-production Qwen3.5 GGUF have not been run end to end.
+NVFP4 decoding. Full production W6A8 encoders and Blackwell-native NVFP4 have
+not been validated end to end.
+Short full-model generation passed with `Qwen3.5-9B-Q4_K_M.gguf` using BF16 on
+CPU. The full 9B GPU attempt exceeded available VRAM on the test card; the mixed
+precision CUDA path is covered by the smaller hybrid regression models above.
 A community MiniMax file can be a pruned encoder: the local file labeled 32B has
 50 language layers, which is not the standard 64-layer Qwen3-VL 32B profile.
 Such variants still need a matching explicit architecture config and original

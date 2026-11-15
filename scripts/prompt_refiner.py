@@ -23,6 +23,7 @@ import sys
 import threading
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import gradio as gr
@@ -38,6 +39,7 @@ if str(EXT_DIR) not in sys.path:
 # Forge imports extension scripts without guaranteeing their root is on sys.path.
 from prompt_refiner_lib import checkpoints, models  # noqa: E402
 from prompt_refiner_lib.preferences import SettingsStore  # noqa: E402
+from prompt_refiner_lib.sampling import SAMPLING_DEFAULTS, sampling_kwargs  # noqa: E402
 from prompt_refiner_lib.lm_heads import KNOWN_HEAD_SOURCES, MissingLMHeadError  # noqa: E402
 from prompt_refiner_lib.quantization import PackedLinear, QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
 
@@ -619,6 +621,7 @@ def run_refine(
     encoder_name, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
     max_new_tokens, seed, device_choice, dtype_choice, rope_choice, keep_loaded, free_vram, empty_think,
     keep_q=True, compress=False, lm_choice="Auto", family="Auto", tokenizer_override="",
+    presence_penalty=SAMPLING_DEFAULTS["presence_penalty"],
 ):
     """Generator: streams the result text, a status line and a progress bar while generating."""
     if not prompt or not prompt.strip():
@@ -637,6 +640,41 @@ def run_refine(
         _STOP.clear()
         print(f"[Prompt Refiner] Starting refinement: {encoder_name}", flush=True)
         t0 = time.time()
+        model = tokenizer = enc = thread = None
+        errors = []
+        released = completed = False
+
+        def release_run(exc=None):
+            """Drop tensor owners before collecting garbage and returning CUDA cache.
+
+            Exceptions retain failed loader/worker frames, including activations
+            and partially loaded models. Clearing only the model cache cannot
+            release those allocations while Gradio still owns the exception.
+            """
+            nonlocal model, tokenizer, enc, released
+            if thread is not None and thread.is_alive():
+                _STOP.set()
+                thread.join()
+            pending = [exc] if exc is not None else []
+            pending.extend(errors)
+            seen = set()
+            while pending:
+                error = pending.pop()
+                if id(error) in seen:
+                    continue
+                seen.add(id(error))
+                traceback.clear_frames(error.__traceback__)
+                # Loader wrappers can retain an earlier allocation failure as
+                # their cause/context even after their own frames are cleared.
+                pending.extend(
+                    linked for linked in (error.__cause__, error.__context__)
+                    if linked is not None
+                )
+            errors.clear()
+            model = tokenizer = enc = None
+            unload_model()
+            released = True
+
         try:
             # Reset before loading so the peak includes model construction and inference.
             if torch.cuda.is_available() and device_choice != "cpu":
@@ -672,21 +710,16 @@ def run_refine(
                 max_new_tokens=max_new_tokens,
                 eos_token_id=eos_ids or None,
                 pad_token_id=eos_ids[-1] if eos_ids else 0,
-                repetition_penalty=float(rep_penalty),
             )
-            if temperature > 0:
-                gen_kwargs.update(do_sample=True, temperature=float(temperature), top_p=float(top_p), top_k=int(top_k))
-                if min_p > 0:
-                    gen_kwargs["min_p"] = float(min_p)
-            else:
-                gen_kwargs.update(do_sample=False, temperature=None, top_p=None, top_k=None)
+            gen_kwargs.update(sampling_kwargs(
+                temperature, top_p, top_k, min_p, rep_penalty,
+                presence_penalty, n_prompt,
+            ))
 
             q = queue.Queue()
             streamer = _TokenStreamer(q)
             gen_kwargs["streamer"] = streamer
             gen_kwargs["stopping_criteria"] = StoppingCriteriaList([_StopFlag()])
-            errors = []
-
             def worker():
                 try:
                     with torch.inference_mode():
@@ -743,21 +776,25 @@ def run_refine(
             status = (f"{thinking_note}Done{stopped}.{limit_note}{steady} {n} tokens in {t_gen:.1f}s ({rate:.1f} tok/s), prompt processing {t_first:.1f}s, "
                       f"model load {t_load:.1f}s, seed {seed}.\n{_STATE['info']}; {_describe(model, device)}")
             print(f"[Prompt Refiner] Done{stopped}: {n} tokens in {t_gen:.1f}s ({rate:.1f} tok/s), seed {seed}.", flush=True)
+            completed = True
             yield result, status, _bar(1.0, f"Done{stopped} - {n} tokens, {rate:.1f} tok/s")
-        except MissingLMHeadError as exc:
+        except (MissingLMHeadError, models.UnknownModelSignatureError) as exc:
+            # Known setup failures belong in Status, not Gradio's exception queue.
             message = str(exc)
             print(f"[Prompt Refiner] Setup needed: {message}", flush=True)
-            unload_model()
+            release_run(exc)
             yield gr.update(), message, ""
-        except gr.Error:
+        except gr.Error as exc:
+            release_run(exc)
             raise
         except Exception as e:
-            print(f"[Prompt Refiner] Failed: {type(e).__name__}: {e}", flush=True)
-            unload_model()
-            raise gr.Error(f"{type(e).__name__}: {e}")
+            message = f"{type(e).__name__}: {e}"
+            print(f"[Prompt Refiner] Failed: {message}", flush=True)
+            release_run(e)
+            raise gr.Error(message) from None
         finally:
-            if not keep_loaded:
-                unload_model()
+            if not released and (not keep_loaded or not completed):
+                release_run()
 
 
 # --------------------------------------------------------------------------------------
@@ -836,14 +873,22 @@ def on_ui_tabs():
                     unload_btn = gr.Button("Unload model")
 
         with gr.Accordion("Sampling options", open=False):
+            gr.Markdown(
+                "Defaults follow the **Qwen3-VL 4B Instruct VL profile**, including presence penalty **1.5** to discourage repetition. "
+                "Use the natural-language system preset to preserve the idea's explicit details."
+            )
             with gr.Row():
-                temperature = gr.Slider(0.0, 2.0, value=0.7, step=0.05, label="Temperature (0 = greedy)")
-                top_p = gr.Slider(0.0, 1.0, value=0.95, step=0.01, label="Top-p")
-                top_k = gr.Slider(0, 200, value=64, step=1, label="Top-k (0 = off)")
-                min_p = gr.Slider(0.0, 1.0, value=0.05, step=0.01, label="Min-p (0 = off)")
+                temperature = gr.Slider(0.0, 2.0, value=SAMPLING_DEFAULTS["temperature"], step=0.05, label="Temperature (0 = greedy)")
+                top_p = gr.Slider(0.0, 1.0, value=SAMPLING_DEFAULTS["top_p"], step=0.01, label="Top-p")
+                top_k = gr.Slider(0, 200, value=SAMPLING_DEFAULTS["top_k"], step=1, label="Top-k (0 = off)")
+                min_p = gr.Slider(0.0, 1.0, value=SAMPLING_DEFAULTS["min_p"], step=0.01, label="Min-p (0 = off)")
             with gr.Row():
-                rep_penalty = gr.Slider(1.0, 2.0, value=1.05, step=0.01, label="Repetition penalty")
+                rep_penalty = gr.Slider(1.0, 2.0, value=SAMPLING_DEFAULTS["repetition_penalty"], step=0.01, label="Repetition penalty",
+                                        info="Above 1 penalizes tokens in both the input and generated text.")
+                presence = gr.Slider(0.0, 2.0, value=SAMPLING_DEFAULTS["presence_penalty"], step=0.05, label="Presence penalty (0 = off)",
+                                     info="Discourages reusing generated tokens. The input idea and system instructions are excluded.")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+            sampling_reset = gr.Button("Use Qwen3-VL defaults", size="sm")
 
         with gr.Accordion("Advanced model settings", open=False):
             with gr.Row():
@@ -897,7 +942,7 @@ def on_ui_tabs():
             "encoder": encoder, "preset": preset, "max_new_tokens": max_new,
             "disable_thinking": empty_think, "temperature": temperature,
             "top_p": top_p, "top_k": top_k, "min_p": min_p,
-            "repetition_penalty": rep_penalty, "seed": seed,
+            "repetition_penalty": rep_penalty, "presence_penalty": presence, "seed": seed,
             "family": family, "tokenizer_directory": tokenizer_override,
             "device": device, "dtype": dtype, "rope": rope,
             "keep_loaded": keep_loaded, "free_vram": free_vram,
@@ -932,6 +977,11 @@ def on_ui_tabs():
             control.change(_remember(key), inputs=[control], outputs=[settings_status], show_progress="hidden")
 
         # ---- events ----
+        sampling_reset.click(
+            lambda: tuple(SAMPLING_DEFAULTS.values()),
+            inputs=[], outputs=[controls[key] for key in SAMPLING_DEFAULTS],
+            show_progress="hidden",
+        )
         def _refresh(current):
             names = list_encoders()
             return gr.update(choices=names, value=current if current in names else (names[0] if names else None))
@@ -962,7 +1012,7 @@ def on_ui_tabs():
         run_btn.click(
             _run_with_details,
             inputs=[encoder, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
-                    max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress, lm_choice, family, tokenizer_override],
+                    max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress, lm_choice, family, tokenizer_override, presence],
             outputs=[output, status, progress_html, model_details],
             show_progress="hidden",
         )

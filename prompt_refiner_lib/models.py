@@ -56,6 +56,10 @@ KNOWN = {
 }
 
 
+class UnknownModelSignatureError(ValueError):
+    """Signal an unfamiliar architecture that needs an original HF config."""
+
+
 def logical_shape(f, keys, key):
     """Recover unpacked W4A8 dimensions before architecture detection."""
     shape = tuple(f.get_slice(key).get_shape())
@@ -352,7 +356,7 @@ def profile(f, path, family="Auto"):
     if tied is None:
         tied = KNOWN[chosen].get(signature)
     if tied is None:
-        raise ValueError(
+        raise UnknownModelSignatureError(
             f"Unknown {chosen} signature {signature}. Supply an HF .config.json with tie_word_embeddings."
         )
     if not isinstance(tied, bool):
@@ -680,23 +684,19 @@ def build_model(
                     if quant is not None:
                         replacements[module_name] = QuantLinear(*quant)
                         return
+            # Preserve FP32 norm parameters, whose forward path casts its result.
+            # Embeddings and convolutions must use the selected activation dtype;
+            # GGUF commonly stores their source weights as FP32 as well.
+            target_dtype = (
+                torch.float32
+                if qwen35
+                and module.weight.ndim == 1
+                and source.get_slice(key).get_dtype() == "F32"
+                else dtype
+            )
             if getattr(source, "is_gguf", False):
-                target_dtype = (
-                    torch.float32
-                    if qwen35
-                    and not isinstance(module, torch.nn.Linear)
-                    and source.get_slice(key).get_dtype() == "F32"
-                    else dtype
-                )
                 state[target] = source.get_tensor(key).to(target_dtype)
             else:
-                target_dtype = (
-                    torch.float32
-                    if qwen35
-                    and not isinstance(module, torch.nn.Linear)
-                    and source.get_slice(key).get_dtype() == "F32"
-                    else dtype
-                )
                 state[target] = _dequantize(
                     source, source_keys, key, target_dtype, work_device
                 )
