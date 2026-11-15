@@ -222,4 +222,6 @@ __marimo__/
 # custom
 .DS_Store/
 /presets.json
-/tokenizer/*.json
+/tokenizer/**
+!/tokenizer/README.txt
+/tests/

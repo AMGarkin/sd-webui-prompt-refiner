@@ -1,3 +1,10 @@
-Optional. Only needed if the extension says "No Qwen tokenizer found".
-Put these files from https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct here:
-  tokenizer.json, tokenizer_config.json, vocab.json, merges.txt
+Tokenizer files are optional when matching assets already exist in Forge Neo.
+
+Use the matching family subfolder:
+  qwen3/       - Qwen3 tokenizer files
+  qwen3_vl/    - Qwen3-VL tokenizer files
+  qwen2_5_vl/  - Qwen2.5-VL tokenizer files
+
+Include tokenizer_config.json and tokenizer.json, or vocab.json plus merges.txt,
+and any other tokenizer assets from the same original model. Files are loaded
+locally. The UI also accepts an explicit tokenizer directory.

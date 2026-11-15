@@ -6,8 +6,9 @@ The LLM is the very same text encoder file you already use for image generation
 (e.g. qwen3vl_4b_fp8_scaled.safetensors from models/text_encoder).
 No Ollama / LM Studio / external server is needed.
 
-Supported (v1): Qwen3 and Qwen3-VL text encoders (bf16 / fp16 / scaled fp8 / int8 / int8 ConvRot .safetensors)
-Not supported (v1): GGUF files, Gemma, Qwen2.5-VL, images as input.
+Supported: text-only Qwen3, Qwen3-VL, and Qwen2.5-VL; safetensors and GGUF.
+Compressed layouts include scaled FP8, INT8, INT8 ConvRot, and Neo W4A8.
+Qwen3.5, MoE, other model families, and image inputs are not supported.
 """
 
 import gc
@@ -15,6 +16,7 @@ import json
 import queue
 import random
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -26,6 +28,13 @@ from modules import script_callbacks, shared
 from modules.paths import models_path, script_path
 
 EXT_DIR = Path(__file__).resolve().parents[1]
+if str(EXT_DIR) not in sys.path:
+    sys.path.insert(0, str(EXT_DIR))
+
+# Forge imports extension scripts without guaranteeing their root is on sys.path.
+from prompt_refiner_lib import checkpoints, models  # noqa: E402
+from prompt_refiner_lib.quantization import QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
+
 PRESETS_FILE = EXT_DIR / "presets.json"
 LOCAL_TOKENIZER_DIR = EXT_DIR / "tokenizer"
 
@@ -115,70 +124,40 @@ def _encoder_dirs():
     return [d for d in dirs if d.is_dir()]
 
 
-def _is_qwen3_file(path: Path) -> bool:
-    """Cheap check (header only): Qwen3 has q_norm / k_norm in every attention block."""
+def _is_supported_file(path):
+    """Cache architecture header checks until the checkpoint changes on disk."""
     try:
-        key = (str(path), path.stat().st_mtime)
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
     except OSError:
         return False
-    if key in _SIGNATURE_CACHE:
-        return _SIGNATURE_CACHE[key]
-    ok = False
-    try:
-        from safetensors import safe_open
-
-        with safe_open(str(path), "pt", device="cpu") as f:
-            ok = any(k.endswith("layers.0.self_attn.q_norm.weight") for k in f.keys())
-    except Exception:
-        ok = False
-    _SIGNATURE_CACHE[key] = ok
-    return ok
+    if key not in _SIGNATURE_CACHE:
+        _SIGNATURE_CACHE[key] = checkpoints.is_supported(path)
+    return _SIGNATURE_CACHE[key]
 
 
 def list_encoders():
+    """Discover supported safetensors/GGUF files and disambiguate duplicate names."""
     _ENCODER_PATHS.clear()
-    for d in _encoder_dirs():
-        for p in sorted(d.rglob("*.safetensors")):
-            if _is_qwen3_file(p):
-                _ENCODER_PATHS.setdefault(str(p.relative_to(d)), p)
-    return list(_ENCODER_PATHS.keys())
-
-
-def find_tokenizer_dir() -> Path:
-    """Prefer a tokenizer shipped with the extension, otherwise reuse one shipped with Forge."""
-    if (LOCAL_TOKENIZER_DIR / "tokenizer.json").is_file() or (LOCAL_TOKENIZER_DIR / "vocab.json").is_file():
-        return LOCAL_TOKENIZER_DIR
-
-    root = Path(script_path) / "backend" / "huggingface"
-    candidates = []
-    if root.is_dir():
-        for tj in root.rglob("tokenizer.json"):
-            candidates.append(tj.parent)
-        for vj in root.rglob("vocab.json"):
-            if (vj.parent / "merges.txt").is_file() and vj.parent not in candidates:
-                candidates.append(vj.parent)
-
-    def score(p: Path):
-        s = str(p).lower()
-        return (("qwen3" in s) * 2 + ("qwen" in s), -len(s))
-
-    candidates = [c for c in candidates if "qwen" in str(c).lower()]
-    if candidates:
-        return sorted(candidates, key=score, reverse=True)[0]
-
-    raise RuntimeError(
-        "No Qwen tokenizer found. Download tokenizer.json, tokenizer_config.json, vocab.json and merges.txt "
-        "from https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct and put them into:\n" + str(LOCAL_TOKENIZER_DIR)
-    )
+    seen = set()
+    for directory in _encoder_dirs():
+        for path in sorted(directory.rglob("*")):
+            if path.suffix.lower() not in (".safetensors", ".gguf") or not path.is_file():
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen or not _is_supported_file(path):
+                continue
+            seen.add(resolved)
+            name = str(path.relative_to(directory))
+            if name in _ENCODER_PATHS:
+                name = str(path)
+            _ENCODER_PATHS[name] = path
+    return list(_ENCODER_PATHS)
 
 
 # --------------------------------------------------------------------------------------
-# Loading a Qwen3 text encoder file into a HF Qwen3ForCausalLM
+# Loading supported Qwen language weights into a text-only causal model
 # --------------------------------------------------------------------------------------
-
-_LAYER_RE = re.compile(r"^(embed_tokens|layers\.\d+|norm)\.")
-_SCALE_SUFFIXES = (".scale_weight", ".weight_scale", ".weight_scale_inv", ".scale_input", ".input_scale", ".weight_scale_2", ".comfy_quant")
-
 
 def _pick_dtype(name: str, device: str):
     if name == "bfloat16":
@@ -195,348 +174,177 @@ def _pick_dtype(name: str, device: str):
     return torch.bfloat16
 
 
-_HADAMARD_CACHE = {}
-
-
-def _hadamard(group_size: int, device):
-    """Normalized 'regular' Hadamard matrix used by ConvRot: Kronecker power of H4, scaled by 1/sqrt(n).
-    It is symmetric and orthonormal, so it is its own inverse."""
-    key = (group_size, str(device))
-    if key not in _HADAMARD_CACHE:
-        h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float32)
-        h = torch.ones(1, 1)
-        n = 1
-        while n < group_size:
-            h = torch.kron(h, h4)
-            n *= 4
-        if n != group_size:
-            raise RuntimeError(f"Unsupported ConvRot group size {group_size} (expected a power of 4).")
-        _HADAMARD_CACHE[key] = (h / (group_size ** 0.5)).to(device)
-    return _HADAMARD_CACHE[key]
-
-
-def _read_comfy_quant(f, keyset, base):
-    name = base + ".comfy_quant"
-    if name not in keyset:
-        return None
-    try:
-        return json.loads(bytes(f.get_tensor(name).tolist()).decode("utf-8"))
-    except Exception:
-        return None
-
-
-def _expand_block_scale(s, n, k):
-    """Expand a [ceil(n/bn), ceil(k/bk)] block-scale grid to [n, k]."""
-    bn = -(-n // s.shape[0])
-    bk = -(-k // s.shape[1])
-    return s.repeat_interleave(bn, 0)[:n].repeat_interleave(bk, 1)[:k]
-
-
-def _requantize_rows(w, work_device):
-    """Dense fp32 [out,in] -> (int8 weight, fp32 per-row scale, 0). Lets any source format live as int8 in VRAM."""
-    w = w.to(work_device, torch.float32)
-    scale = (w.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
-    q = torch.round(w / scale).clamp_(-128, 127).to(torch.int8)
-    return q.contiguous(), scale.reshape(-1).contiguous(), 0
-
-
-def _dequantize(f, keyset, key: str, dtype, work_device="cpu"):
-    """Load f[key] as a dense tensor.
-    Handles: plain bf16/fp16, scaled fp8, row/tensor-scaled int8 and int8 + ConvRot (Hadamard-rotated)."""
-    w = f.get_tensor(key)
-    base = key[: -len(".weight")]
-    cq = _read_comfy_quant(f, keyset, base)
-    fmt = str(cq.get("format", "")) if cq else ""
-    if cq and not any(x in fmt for x in ("float8", "int8", "fp8")):
-        raise RuntimeError(f"Unsupported quantization format '{fmt}' in {key} (supported: fp8 / int8 / int8 ConvRot).")
-
-    scale = None
-    for suffix in (".scale_weight", ".weight_scale", ".weight_scale_inv"):
-        if base + suffix in keyset:
-            scale = f.get_tensor(base + suffix)
-            break
-
-    if scale is None and w.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
-        return w.to(dtype)  # ordinary bf16/fp16 weight
-
-    prev_tf32 = None
-    if torch.cuda.is_available():
-        prev_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False  # keep the un-rotation exact
-    try:
-        w = w.to(work_device, torch.float32)
-        if scale is not None:
-            s = scale.to(work_device, torch.float32)
-            if s.ndim == 1 and s.numel() > 1 and w.ndim == 2:
-                s = s.view(-1, 1) if s.numel() == w.shape[0] else s.view(1, -1)
-            elif s.ndim == 2 and w.ndim == 2 and not (s.shape[0] == w.shape[0] and s.shape[1] == 1):
-                s = _expand_block_scale(s, w.shape[0], w.shape[1])  # e.g. Qwen FP8: one scale per 128x128 block
-            w = w * s
-        if cq and cq.get("convrot") and w.ndim == 2:
-            gs = int(cq.get("convrot_groupsize", 256))
-            out_f, in_f = w.shape
-            if in_f % gs == 0:
-                w = (w.view(out_f, in_f // gs, gs) @ _hadamard(gs, w.device)).reshape(out_f, in_f)
-        return w.to(dtype)
-    finally:
-        if prev_tf32 is not None:
-            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
-
-
 # --------------------------------------------------------------------------------------
-# Compressed (int8 / fp8) linear layer that stays small in VRAM
+# Separate "LM head" files for encoders that were shipped without lm_head.weight
 # --------------------------------------------------------------------------------------
-# ConvRot stores W_rot = W_g @ H^T (per group of columns). Since H is symmetric and orthonormal,
-#   y = x @ W^T = sum_g (x_g @ H) @ W_rot_g^T
-# so instead of un-rotating the weights we rotate the (tiny) activations and keep the int8 weights as they are.
-
-_ACT_H_CACHE = {}
-_TRITON = {"state": None}  # None = not tested yet, True = verified, False = disabled
-
-try:
-    import triton
-    import triton.language as tl
-
-    _GEMV_CONFIGS = [
-        triton.Config({"BLOCK_N": 8, "BLOCK_K": 512}, num_warps=4),   # previous fixed setting
-        triton.Config({"BLOCK_N": 4, "BLOCK_K": 512}, num_warps=4),
-        triton.Config({"BLOCK_N": 4, "BLOCK_K": 1024}, num_warps=4),
-        triton.Config({"BLOCK_N": 8, "BLOCK_K": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 8, "BLOCK_K": 1024}, num_warps=8),
-        triton.Config({"BLOCK_N": 16, "BLOCK_K": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 16, "BLOCK_K": 512}, num_warps=8),
-        triton.Config({"BLOCK_N": 2, "BLOCK_K": 1024}, num_warps=2),
-    ]
-
-    def _autotune():
-        try:  # newer Triton can remember the winner between sessions
-            return triton.autotune(configs=_GEMV_CONFIGS, key=["N", "K"], cache_results=True)
-        except TypeError:
-            return triton.autotune(configs=_GEMV_CONFIGS, key=["N", "K"])
-
-    @_autotune()
-    @triton.jit
-    def _gemv_int8_kernel(x_ptr, w_ptr, s_ptr, y_ptr, N, K, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-        pid = tl.program_id(0)
-        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
-        row_off = offs_n[:, None].to(tl.int64) * K
-        acc = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)  # reduce once at the end, not every iteration
-        for k0 in range(0, K, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < K
-            xv = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-            wv = tl.load(w_ptr + row_off + offs_k[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0).to(tl.float32)
-            acc += wv * xv[None, :]
-        res = tl.sum(acc, axis=1)
-        sc = tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)
-        tl.store(y_ptr + offs_n, (res * sc).to(y_ptr.dtype.element_ty), mask=n_mask)
-
-    _HAVE_TRITON = True
-except Exception:
-    _HAVE_TRITON = False
-    _TRITON["state"] = False
+# Diffusion encoders may omit the language output projection. Model profiles
+# determine whether embeddings are genuinely tied; untied models need exact weights.
+LM_HEAD_DIR = Path(models_path) / "prompt_refiner" / "lm_heads"
+_ST_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
 
 
-def _act_hadamard(group_size, device, dtype):
-    key = (group_size, str(device), dtype)
-    if key not in _ACT_H_CACHE:
-        _ACT_H_CACHE[key] = _hadamard(group_size, "cpu").to(device=device, dtype=dtype)
-    return _ACT_H_CACHE[key]
+def list_lm_heads():
+    try:
+        LM_HEAD_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return []
+    return sorted(p.name for p in LM_HEAD_DIR.glob("*.safetensors"))
 
 
-class QuantLinear(torch.nn.Module):
-    """y = (rotate(x) @ W_q^T) * row_scale, with W_q kept as int8 / fp8 in memory."""
-
-    def __init__(self, weight, scale, group_size):
-        super().__init__()
-        self.register_buffer("weight", weight, persistent=False)
-        self.register_buffer("scale", scale, persistent=False)  # float32, shape [out]
-        self.group_size = int(group_size)
-        self.out_features, self.in_features = weight.shape
-
-    def _triton_gemv(self, x2):
-        if _TRITON["state"] is False or not _HAVE_TRITON:
-            return None
-        if self.weight.dtype != torch.int8 or not x2.is_cuda or x2.dtype not in (torch.bfloat16, torch.float16):
-            return None
-        try:
-            x2 = x2.contiguous()
-            y = torch.empty((1, self.out_features), dtype=x2.dtype, device=x2.device)
-            grid = lambda meta: (triton.cdiv(self.out_features, meta["BLOCK_N"]),)
-            _gemv_int8_kernel[grid](x2, self.weight, self.scale, y, self.out_features, self.in_features)
-            if _TRITON["state"] is None:  # one-time self-check against the plain PyTorch path
-                ref = self._torch_linear(x2)
-                err = ((y.float() - ref.float()).norm() / (ref.float().norm() + 1e-9)).item()
-                _TRITON["state"] = err < 0.02
-                if not _TRITON["state"]:
-                    print(f"[Prompt Refiner] Triton kernel gave a different result (rel. error {err:.3g}); using PyTorch path.")
-                    return ref
-            return y
-        except Exception as e:
-            _TRITON["state"] = False
-            print(f"[Prompt Refiner] Triton kernel disabled: {type(e).__name__}: {e}")
-            return None
-
-    def _torch_linear(self, x2):
-        y = torch.nn.functional.linear(x2, self.weight.to(x2.dtype))
-        return (y.float() * self.scale).to(x2.dtype)
-
-    def forward(self, x):
-        lead = x.shape[:-1]
-        x2 = x.reshape(-1, self.in_features)
-        if self.group_size:
-            g = self.group_size
-            h = _act_hadamard(g, x2.device, x2.dtype)
-            x2 = torch.matmul(x2.reshape(-1, self.in_features // g, g), h).reshape(-1, self.in_features)
-        y = self._triton_gemv(x2) if x2.shape[0] == 1 else None
-        if y is None:
-            y = self._torch_linear(x2)
-        return y.reshape(*lead, self.out_features)
-
-
-def _load_quantized(f, keyset, key):
-    """Return (weight_1byte, row_scale_fp32[out], convrot_group) for a layer we can keep compressed, else None."""
-    w = f.get_tensor(key)
-    if w.dtype not in (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2) or w.ndim != 2:
-        return None
-    base = key[: -len(".weight")]
-    scale = None
-    for suffix in (".scale_weight", ".weight_scale", ".weight_scale_inv"):
-        if base + suffix in keyset:
-            scale = f.get_tensor(base + suffix)
-            break
-    if scale is None:
-        return None
-    cq = _read_comfy_quant(f, keyset, base)
-    if cq and not any(x in str(cq.get("format", "")) for x in ("float8", "int8", "fp8")):
-        raise RuntimeError(f"Unsupported quantization format '{cq.get('format')}' in {key}.")
-    out_f, in_f = w.shape
-    if scale.ndim == 2 and scale.shape[1] != 1:
-        return None  # block-wise grid (e.g. Qwen FP8 128x128): handled by re-quantization instead
-    s = scale.to(torch.float32).reshape(-1)
-    if s.numel() == 1:
-        s = s.expand(out_f).contiguous()
-    elif s.numel() != out_f:
-        return None  # block-wise scales: fall back to full dequantization
-    gs = 0
-    if cq and cq.get("convrot"):
-        g = int(cq.get("convrot_groupsize", 256))
-        gs = g if in_f % g == 0 else 0
-        if gs:
-            _hadamard(gs, "cpu")  # validates the group size early
-    return w.contiguous(), s, gs
-
-
-_PROJ_RE = re.compile(r"^layers\.\d+\.(self_attn|mlp)\.\w+_proj\.weight$")
-
-
-def build_model(path: Path, dtype, rope_choice: str, work_device="cpu", keep_quantized=True, compress=False):
+def _sidecar_shape(path):
     from safetensors import safe_open
-    from transformers import Qwen3Config, Qwen3ForCausalLM
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
     with safe_open(str(path), "pt", device="cpu") as f:
-        keys = list(f.keys())
-        keyset = set(keys)
+        return list(f.get_slice("lm_head.weight").get_shape())
 
-        # Detect the key prefix (Comfy files: "model.", Qwen3-VL HF layout: "model.language_model.", bare: "")
-        anchor = next((k for k in keys if k.endswith("layers.0.self_attn.q_proj.weight")), None)
-        if anchor is None:
-            raise RuntimeError("This file does not look like a Qwen3 text encoder.")
-        prefix = anchor[: -len("layers.0.self_attn.q_proj.weight")]
 
-        def shape(k):
-            return list(f.get_slice(k).get_shape())
+def _pick_lm_head(choice, enc_path, vocab, hidden, profile=None):
+    """Select explicitly, by exact encoder stem, or by matching original source metadata.
 
-        vocab, hidden = shape(prefix + "embed_tokens.weight")
-        layer_ids = {int(m.group(1)) for k in keys if k.startswith(prefix) for m in [re.match(r"layers\.(\d+)\.", k[len(prefix):])] if m}
-        n_layers = max(layer_ids) + 1
-        head_dim = shape(prefix + "layers.0.self_attn.q_norm.weight")[0]
-        n_heads = shape(prefix + "layers.0.self_attn.q_proj.weight")[0] // head_dim
-        n_kv = shape(prefix + "layers.0.self_attn.k_proj.weight")[0] // head_dim
-        inter = shape(prefix + "layers.0.mlp.gate_proj.weight")[0]
+    Equal dimensions do not establish compatibility: unrelated fine-tunes often
+    share the same shape. An explicit selection is the user's checkpoint binding.
+    """
+    from safetensors import safe_open
 
-        has_lm_head = "lm_head.weight" in keyset
-        is_vl = (any(".visual." in k or k.startswith("visual.") for k in keys)
-                 or "vl" in path.name.lower() or "2507" in path.name)  # Qwen3-VL and the 2507 refreshes use 5M
-        if rope_choice.startswith("1"):
-            theta = 1_000_000.0
-        elif rope_choice.startswith("5"):
-            theta = 5_000_000.0
-        else:
-            theta = 5_000_000.0 if is_vl else 1_000_000.0
+    def validate(path):
+        if not path.is_file():
+            raise RuntimeError(f"LM head file not found: {path}")
+        if _sidecar_shape(path) != [vocab, hidden]:
+            raise RuntimeError(f"LM head {path.name} does not match vocabulary/hidden size {[vocab, hidden]}.")
+        return path
 
-        cfg = Qwen3Config(
-            vocab_size=vocab,
-            hidden_size=hidden,
-            intermediate_size=inter,
-            num_hidden_layers=n_layers,
-            num_attention_heads=n_heads,
-            num_key_value_heads=n_kv,
-            head_dim=head_dim,
-            max_position_embeddings=40960,
-            rms_norm_eps=1e-6,
-            rope_theta=theta,
-            tie_word_embeddings=not has_lm_head,
-            attention_bias=False,
-        )
-        # newer transformers keep the theta inside rope_parameters
-        rp = getattr(cfg, "rope_parameters", None)
-        if isinstance(rp, dict):
-            rp["rope_theta"] = theta
+    if choice and choice != "Auto":
+        path = LM_HEAD_DIR / choice
+        if path.resolve().parent != LM_HEAD_DIR.resolve():
+            raise RuntimeError("LM head selection must be a file in the LM head directory.")
+        return validate(path)
+    exact = LM_HEAD_DIR / f"{enc_path.stem}.safetensors"
+    if exact.is_file():
+        return validate(exact)
+    source = (profile or {}).get("source", "")
+    matches = []
+    if source:
+        for path in sorted(LM_HEAD_DIR.glob("*.safetensors")):
+            with safe_open(str(path), "pt", device="cpu") as f:
+                if (f.metadata() or {}).get("source") == source:
+                    matches.append(validate(path))
+    if len(matches) > 1:
+        raise RuntimeError("Several LM heads match the original source; select one explicitly.")
+    return matches[0] if matches else None
 
-        if not has_lm_head and n_layers >= 36 and hidden >= 4096:
-            raise RuntimeError(
-                "This encoder file has no 'lm_head' weights and a model of this size does not tie them to the "
-                "embeddings, so it cannot generate text. Use a Qwen3 / Qwen3-VL 4B (or smaller) file, "
-                "or a full LLM checkpoint."
-            )
 
-        with torch.device("meta"):
-            model = Qwen3ForCausalLM(cfg)
-        # rotary buffers must be real tensors (they are not part of the checkpoint)
-        model.model.rotary_emb = Qwen3RotaryEmbedding(config=cfg, device="cpu")
+def _fetch_range(url, headers, a, b):
+    """Generator: download bytes a..b (inclusive) with an HTTP Range request, yielding (done, total). Returns the bytes."""
+    import requests
 
-        sd = {}
-        quant = {}  # module path -> (weight, scale, group)
-        for k in keys:
-            if not k.startswith(prefix) or k.endswith(_SCALE_SUFFIXES) or k.endswith("scaled_fp8"):
-                continue
-            rest = k[len(prefix):]
-            if not _LAYER_RE.match(rest):
-                continue
-            if keep_quantized and _PROJ_RE.match(rest):
-                q = _load_quantized(f, keyset, k)
-                if q is None:
-                    one_byte = f.get_slice(k).get_dtype() in ("F8_E4M3", "F8_E5M2", "I8")
-                    if one_byte or compress:  # block-scaled fp8, or user asked to shrink bf16/fp16 weights
-                        q = _requantize_rows(_dequantize(f, keyset, k, torch.float32, work_device), work_device)
-                if q is not None:
-                    quant["model." + rest[: -len(".weight")]] = q
-                    continue
-            if k.endswith(".weight") and len(shape(k)) == 2:
-                sd["model." + rest] = _dequantize(f, keyset, k, dtype, work_device)
-            else:
-                sd["model." + rest] = f.get_tensor(k).to(dtype)
-        if has_lm_head:
-            sd["lm_head.weight"] = _dequantize(f, keyset, "lm_head.weight", dtype, work_device)
+    total = b - a + 1
+    r = requests.get(url, headers={**headers, "Range": f"bytes={a}-{b}"}, stream=True, timeout=60)
+    try:
+        if r.status_code != 206:
+            raise RuntimeError(f"The server did not honour the range request (HTTP {r.status_code}), "
+                               "so only the lm_head cannot be downloaded from this repo.")
+        buf = bytearray()
+        for chunk in r.iter_content(1 << 22):
+            buf += chunk
+            yield len(buf), total
+        if len(buf) != total:
+            raise RuntimeError(f"Incomplete download ({len(buf)} of {total} bytes).")
+        return buf
+    finally:
+        r.close()
 
-    missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
-    missing = [m for m in missing if (m != "lm_head.weight" or has_lm_head) and m[: -len(".weight")] not in quant]
-    if missing:
-        raise RuntimeError(f"Missing weights in encoder file: {missing[:5]}{' ...' if len(missing) > 5 else ''}")
-    if not has_lm_head:
-        model.lm_head.weight = model.model.embed_tokens.weight
-    for mod_path, (qw, qs, qg) in quant.items():
-        parent_path, _, attr = mod_path.rpartition(".")
-        setattr(model.get_submodule(parent_path), attr, QuantLinear(qw, qs, qg))
-    model._pr_quant_layers = len(quant)
-    model.eval()
-    info = f"Qwen3 {n_layers} layers, hidden {hidden}, heads {n_heads}/{n_kv}, rope_theta {theta:g}"
-    if quant:
-        info += f", {len(quant)} layers kept compressed"
-    return model, info
+
+def _create_lm_head(repo_id, as_int8, token):
+    """Generator of (html, dropdown_update). Downloads ONLY lm_head.weight from a Hugging Face repo."""
+    import struct
+
+    from huggingface_hub import hf_hub_download, hf_hub_url
+    from safetensors.torch import save_file
+
+    repo_id = (repo_id or "").strip()
+    if not repo_id:
+        raise RuntimeError("Enter a Hugging Face repo id, e.g. Qwen/Qwen3.5-9B")
+    token = (token or "").strip() or None
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    yield _bar(None, "Looking up lm_head.weight ...", busy=True), gr.update()
+    key = None
+    fname = "model.safetensors"
+    try:
+        idx = hf_hub_download(repo_id, "model.safetensors.index.json", token=token)
+    except Exception:
+        idx = None  # single-file repo
+    if idx:
+        wm = json.loads(Path(idx).read_text(encoding="utf-8"))["weight_map"]
+        key = next((k for k in wm if k.endswith("lm_head.weight")), None)
+        if key is None:
+            raise RuntimeError("This repo has no lm_head.weight (the model ties it to the embeddings) - no file needed.")
+        fname = wm[key]
+    url = hf_hub_url(repo_id, fname)
+
+    # header: 8 bytes length + JSON
+    head = yield from _drain(_fetch_range(url, headers, 0, 7), "Reading header")
+    n = struct.unpack("<Q", bytes(head))[0]
+    header = json.loads(bytes((yield from _drain(_fetch_range(url, headers, 8, 8 + n - 1), "Reading header"))))
+    key = key or next((k for k in header if k.endswith("lm_head.weight")), None)
+    if key is None or key not in header:
+        raise RuntimeError(f"lm_head.weight not found in {fname} of {repo_id}.")
+    info = header[key]
+    if info["dtype"] not in _ST_DTYPES:
+        raise RuntimeError(f"Unexpected lm_head dtype {info['dtype']}.")
+    shape = info["shape"]
+    b0, b1 = info["data_offsets"]
+    base = 8 + n
+
+    data = yield from _drain(_fetch_range(url, headers, base + b0, base + b1 - 1), "Downloading lm_head")
+    w = torch.frombuffer(data, dtype=_ST_DTYPES[info["dtype"]]).reshape(shape)
+
+    yield _bar(None, "Converting and saving ...", busy=True), gr.update()
+    LM_HEAD_DIR.mkdir(parents=True, exist_ok=True)
+    out_name = repo_id.replace("/", "__") + (".int8" if as_int8 else ".bf16") + ".safetensors"
+    out = LM_HEAD_DIR / out_name
+    if as_int8:
+        q = torch.empty(shape, dtype=torch.int8)
+        sc = torch.empty(shape[0], dtype=torch.float32)
+        for i in range(0, shape[0], 8192):  # chunked to keep RAM low
+            blk = w[i:i + 8192].float()
+            c = (blk.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
+            q[i:i + 8192] = torch.round(blk / c).clamp(-128, 127).to(torch.int8)
+            sc[i:i + 8192] = c.squeeze(1)
+        tensors = {"lm_head.weight": q, "lm_head.weight_scale": sc.view(-1, 1).contiguous()}
+    else:
+        tensors = {"lm_head.weight": w.contiguous()}
+    save_file(tensors, str(out), metadata={"source": repo_id, "format": "int8-rowwise" if as_int8 else "dense"})
+    mb = out.stat().st_size / 1e6
+    names = list_lm_heads()
+    yield (_bar(1.0, f"Saved {out_name} ({mb:.0f} MB). It is selected below."),
+           gr.update(choices=["Auto"] + names, value=out_name))
+
+
+def _drain(gen, label):
+    """Run a _fetch_range generator, yielding progress bars for the UI, and return its bytes."""
+    while True:
+        try:
+            done, total = next(gen)
+        except StopIteration as stop:
+            return stop.value
+        yield _bar(done / total, f"{label}: {done / 1e6:.0f} / {total / 1e6:.0f} MB"), gr.update()
+
+
+def create_lm_head_ui(repo_id, as_int8, token):
+    try:
+        yield from _create_lm_head(repo_id, as_int8, token)
+    except gr.Error:
+        raise
+    except Exception as e:
+        raise gr.Error(f"{type(e).__name__}: {e}")
+
+
+def build_model(path, dtype, rope_choice, work_device="cpu", keep_quantized=True, compress=False,
+                lm_head_choice="Auto", family="Auto"):
+    """Build a text-only causal model using validated architecture and storage adapters."""
+    return models.build_model(path, dtype, rope_choice, work_device, keep_quantized, compress,
+                              lm_head_choice, family, _pick_lm_head)
 
 
 # --------------------------------------------------------------------------------------
@@ -567,17 +375,27 @@ def _free_forge_vram():
         torch.cuda.empty_cache()
 
 
-def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q=True, compress=False):
+def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q=True, compress=False,
+               lm_choice="Auto", family="Auto", tokenizer_override=""):
+    """Cache a model only while its weights, configuration, and tokenizer stay unchanged."""
     path = _ENCODER_PATHS.get(encoder_name)
     if path is None:
         list_encoders()
         path = _ENCODER_PATHS.get(encoder_name)
     if path is None:
-        raise RuntimeError("Select a text encoder first (put Qwen3 / Qwen3-VL files into models/text_encoder).")
+        raise RuntimeError("Select a supported Qwen text encoder in models/text_encoder.")
 
     device = "cuda" if (device_choice.startswith("auto") and torch.cuda.is_available()) or device_choice == "cuda" else "cpu"
     dtype = _pick_dtype(dtype_choice, device)
-    key = (str(path), device, str(dtype), rope_choice, bool(keep_q), bool(compress))
+    resolved = models.inspect_profile(path, family)
+    tokenizer_dir = models.find_tokenizer(path, resolved, script_path, LOCAL_TOKENIZER_DIR, tokenizer_override)
+    def stamp(p):
+        return (str(p), p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else (str(p), None, None)
+    watched = [path, path.with_suffix(".config.json"), path.parent / "config.json"]
+    watched.extend(sorted(tokenizer_dir.glob("*")))
+    watched.extend(sorted(LM_HEAD_DIR.glob("*.safetensors")))
+    key = (tuple(stamp(p) for p in watched), device, str(dtype), rope_choice, bool(keep_q),
+           bool(compress), lm_choice, family, str(tokenizer_dir))
 
     if _STATE["key"] == key and _STATE["model"] is not None:
         return _STATE["model"], _STATE["tokenizer"], device
@@ -586,22 +404,24 @@ def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram
     if device == "cuda" and free_vram:
         _free_forge_vram()
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(str(find_tokenizer_dir()))
-    model, info = build_model(path, dtype, rope_choice, device, keep_q, compress)
+    tokenizer = models.load_tokenizer(tokenizer_dir, resolved)
+    model, info = build_model(path, dtype, rope_choice, device, keep_q, compress, lm_choice, family)
+    info += f"; tokenizer: {tokenizer_dir}"
     model.to(device)  # no dtype argument on purpose: keeps rotary buffers in fp32
 
     _STATE.update(key=key, model=model, tokenizer=tokenizer, info=info)
     return model, tokenizer, device
 
 
-def _build_chat(system: str, user: str, empty_think: bool) -> str:
-    text = ""
+def _build_chat(system, user, empty_think, tokenizer, family):
+    """Use the selected tokenizer's chat template and limit thinking controls to Qwen3."""
+    messages = []
     if system.strip():
-        text += f"<|im_start|>system\n{system.strip()}<|im_end|>\n"
-    text += f"<|im_start|>user\n{user.strip()}<|im_end|>\n<|im_start|>assistant\n"
-    if empty_think:
+        messages.append({"role": "system", "content": system.strip()})
+    messages.append({"role": "user", "content": user.strip()})
+    kwargs = {"enable_thinking": False} if empty_think and family == "Qwen3" else {}
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    if empty_think and family == "Qwen3" and not text.rstrip().endswith("</think>"):
         text += "<think>\n\n</think>\n\n"
     return text
 
@@ -612,8 +432,7 @@ def _clean_output(text: str) -> str:
     stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     stripped = re.sub(r"<think>.*$", "", stripped, flags=re.DOTALL)  # unfinished thinking
     stripped = stripped.strip()
-    if not stripped:
-        stripped = text.replace("<think>", "").replace("</think>", "").strip()
+    # Keep reasoning hidden even when the model has not produced a final prompt yet.
     stripped = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", stripped).strip()
     if len(stripped) > 1 and stripped[0] == stripped[-1] and stripped[0] in "\"'":
         stripped = stripped[1:-1].strip()
@@ -628,6 +447,9 @@ class _TokenStreamer(BaseStreamer):
         self.ids = []
         self._skip_prompt = True
         self.t_first = None
+        self.t_warm = None   # time the 8th token arrived (Triton compile / autotune happens before this)
+        self.n_warm = 0
+        self.t_last = None
 
     def put(self, value):
         if self._skip_prompt:  # first call carries the prompt itself
@@ -636,6 +458,9 @@ class _TokenStreamer(BaseStreamer):
         if self.t_first is None:
             self.t_first = time.time()
         self.ids.extend(value.reshape(-1).tolist())
+        self.t_last = time.time()
+        if self.t_warm is None and len(self.ids) >= 8:
+            self.t_warm, self.n_warm = self.t_last, len(self.ids)
         self.q.put("tok")
 
     def end(self):
@@ -666,8 +491,15 @@ def _describe(model, device):
     s = f"device {p.device}, {str(p.dtype).replace('torch.', '')}, attention: {getattr(model.config, '_attn_implementation', '?')}"
     nq = getattr(model, "_pr_quant_layers", 0)
     if nq:
-        k = {True: "Triton (verified)", False: "PyTorch fallback", None: "not used yet"}[_TRITON["state"]]
-        s += f", {nq} compressed layers, GEMV kernel: {k}"
+        s += f", {getattr(model, '_pr_w4_layers', 0)} W4A8 layers, {getattr(model, '_pr_gguf_layers', 0)} GGUF layers"
+        # Report only storage types actually present in this model, not a previous run.
+        kinds = {module.weight.dtype for module in model.modules() if isinstance(module, QuantLinear)}
+        for dtype in sorted(kinds, key=str):
+            state = _TRITON if dtype == torch.int8 else _FP8_TRITON.get(dtype, {"state": None})
+            kernel = {True: "Triton (verified)", False: "PyTorch fallback", None: "not verified / PyTorch fallback"}[state["state"]]
+            s += f", {str(dtype).replace('torch.', '')} GEMV: {kernel}"
+        if getattr(model, "_pr_gguf_layers", 0):
+            s += ", GGUF: per-layer dequantization + PyTorch linear"
     if device == "cuda":
         free, total = torch.cuda.mem_get_info()
         s += f", GPU {torch.cuda.get_device_name(0)}, VRAM in use {(total - free) / 1e9:.1f}/{total / 1e9:.1f} GB"
@@ -680,29 +512,43 @@ def _describe(model, device):
 def run_refine(
     encoder_name, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
     max_new_tokens, seed, device_choice, dtype_choice, rope_choice, keep_loaded, free_vram, empty_think,
-    keep_q=True, compress=False,
+    keep_q=True, compress=False, lm_choice="Auto", family="Auto", tokenizer_override="",
 ):
     """Generator: streams the result text, a status line and a progress bar while generating."""
     if not prompt or not prompt.strip():
-        raise gr.Error("Enter a prompt first.")
+        message = "Enter a prompt first."
+        print(f"[Prompt Refiner] Skipped: {message}", flush=True)
+        yield gr.update(), message, ""
+        return
     if not encoder_name:
-        raise gr.Error("No Qwen3 / Qwen3-VL text encoder found in models/text_encoder.")
+        message = "Select a supported Qwen safetensors or GGUF encoder first."
+        print(f"[Prompt Refiner] Skipped: {message}", flush=True)
+        yield gr.update(), message, ""
+        return
 
     max_new_tokens = int(max_new_tokens)
     with _RUN_LOCK:
         _STOP.clear()
+        print(f"[Prompt Refiner] Starting refinement: {encoder_name}", flush=True)
         t0 = time.time()
         try:
             cached = _STATE["model"] is not None
-            msg = "Loading model..." if cached else "Loading model (reading file, decoding weights - first run only)..."
+            msg = "Preparing selected model..." if cached else "Loading model from file (reading and decoding weights)..."
             yield gr.update(), msg, _bar(None, msg, busy=True)
 
-            model, tokenizer, device = _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q, compress)
+            model, tokenizer, device = _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q, compress, lm_choice, family, tokenizer_override)
             t_load = time.time() - t0
 
-            text = _build_chat(system_prompt, prompt, empty_think)
+            thinking_only = bool(re.search(r"thinking[-_ ]?2507", encoder_name, re.IGNORECASE))
+            thinking_note = ""
+            if thinking_only and empty_think:
+                thinking_note = "This Thinking-2507 checkpoint does not support disabling thinking; the checkbox was ignored. "
+                print(f"[Prompt Refiner] {thinking_note.strip()}", flush=True)
+            text = _build_chat(system_prompt, prompt, empty_think and not thinking_only, tokenizer, model._pr_profile["family"])
             enc = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(device)
             n_prompt = enc["input_ids"].shape[1]
+            if n_prompt + max_new_tokens > model.config.max_position_embeddings:
+                raise ValueError("Prompt plus requested output exceeds the model context window. Shorten the prompt or lower Max new tokens.")
 
             seed = int(seed)
             if seed < 0:
@@ -777,15 +623,22 @@ def run_refine(
             t_gen = time.time() - t1
             t_first = (streamer.t_first - t1) if streamer.t_first else t_gen
             stopped = " (stopped by user)" if _STOP.is_set() else ""
+            steady = ""
+            if streamer.t_warm and n - streamer.n_warm >= 8 and streamer.t_last > streamer.t_warm:
+                sr = (n - streamer.n_warm) / (streamer.t_last - streamer.t_warm)
+                steady = (f" Steady-state: {sr:.1f} tok/s (after warm-up; the first 8 tokens took "
+                          f"{streamer.t_warm - streamer.t_first:.1f}s).")
             limit_note = ""
             if n >= max_new_tokens and not _STOP.is_set():
                 limit_note = " Token limit reached - raise 'Max new tokens' (thinking models often need 2000+)."
-            status = (f"Done{stopped}.{limit_note} {n} tokens in {t_gen:.1f}s ({rate:.1f} tok/s), prompt processing {t_first:.1f}s, "
+            status = (f"{thinking_note}Done{stopped}.{limit_note}{steady} {n} tokens in {t_gen:.1f}s ({rate:.1f} tok/s), prompt processing {t_first:.1f}s, "
                       f"model load {t_load:.1f}s, seed {seed}.\n{_STATE['info']}; {_describe(model, device)}")
+            print(f"[Prompt Refiner] Done{stopped}: {n} tokens in {t_gen:.1f}s ({rate:.1f} tok/s), seed {seed}.", flush=True)
             yield result, status, _bar(1.0, f"Done{stopped} - {n} tokens, {rate:.1f} tok/s")
         except gr.Error:
             raise
         except Exception as e:
+            print(f"[Prompt Refiner] Failed: {type(e).__name__}: {e}", flush=True)
             unload_model()
             raise gr.Error(f"{type(e).__name__}: {e}")
         finally:
@@ -817,41 +670,49 @@ def on_ui_tabs():
 
     with gr.Blocks(analytics_enabled=False) as ui:
         gr.Markdown(
-            "Rewrite or expand prompts with your own text encoder (Qwen3 / Qwen3-VL). "
+            "Rewrite or expand prompts with your Qwen3, Qwen3-VL, or Qwen2.5-VL text encoder (safetensors / GGUF). "
             "Runs locally inside Forge - no Ollama or LM Studio needed."
         )
+        # Keep prompt editing and generation controls visible; uncommon settings
+        # belong in collapsed sections below the main two-column workspace.
+        with gr.Row():
+            encoder = gr.Dropdown(
+                label="Text encoder (models/text_encoder)", choices=encoders,
+                value=encoders[0] if encoders else None, scale=10,
+            )
+            refresh_btn = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
         with gr.Row():
             with gr.Column(scale=1):
-                with gr.Row():
-                    encoder = gr.Dropdown(
-                        label="Text encoder (models/text_encoder)", choices=encoders,
-                        value=encoders[0] if encoders else None, scale=10,
-                    )
-                    refresh_btn = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
-                prompt = gr.Textbox(label="Your prompt / idea", lines=6, placeholder="a cat astronaut on mars, cinematic")
-                preset = gr.Dropdown(label="System prompt preset", choices=preset_names,
-                                     value=preset_names[0] if preset_names else None)
-                system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
-                                           value=presets[preset_names[0]] if preset_names else "")
-                with gr.Row():
-                    preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="My preset")
-                    save_btn = gr.Button("Save preset", scale=1)
-                    delete_btn = gr.Button("Delete selected", scale=1)
-
-            with gr.Column(scale=1):
+                prompt = gr.Textbox(label="Your prompt / idea", lines=8, placeholder="a cat astronaut on mars, cinematic")
                 with gr.Row():
                     run_btn = gr.Button("Refine prompt", variant="primary", scale=4)
                     stop_btn = gr.Button("Stop", scale=1)
-                progress_html = gr.HTML(value="")
+                preset = gr.Dropdown(label="System prompt preset", choices=preset_names,
+                                     value=preset_names[0] if preset_names else None)
+                max_new = gr.Slider(32, 4096, value=768, step=16, label="Max new tokens")
+                empty_think = gr.Checkbox(value=True, label="Disable thinking via chat template (switchable Qwen3 only)",
+                                          info="Dedicated Thinking-2507 checkpoints cannot disable thinking.")
+                with gr.Accordion("System prompt & presets", open=False):
+                    system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
+                                               value=presets[preset_names[0]] if preset_names else "")
+                    with gr.Row():
+                        preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="My preset")
+                        save_btn = gr.Button("Save preset", scale=1)
+                        delete_btn = gr.Button("Delete selected", scale=1)
+
+            with gr.Column(scale=1):
                 output = gr.Textbox(label="Result", lines=14, interactive=True, show_copy_button=True)
-                status = gr.Textbox(label="Status", interactive=False, lines=2)
                 with gr.Row():
                     send_txt = gr.Button("Send to txt2img")
                     send_img = gr.Button("Send to img2img")
                     reuse_btn = gr.Button("Use result as input")
+                progress_html = gr.HTML(value="")
+                status = gr.Textbox(label="Status", interactive=False, lines=2)
+                with gr.Accordion("Model details", open=False):
+                    model_details = gr.Textbox(label="Loaded model details", interactive=False, lines=5)
                     unload_btn = gr.Button("Unload model")
 
-        with gr.Accordion("Sampling & model options", open=False):
+        with gr.Accordion("Sampling options", open=False):
             with gr.Row():
                 temperature = gr.Slider(0.0, 2.0, value=0.7, step=0.05, label="Temperature (0 = greedy)")
                 top_p = gr.Slider(0.0, 1.0, value=0.95, step=0.01, label="Top-p")
@@ -859,19 +720,43 @@ def on_ui_tabs():
                 min_p = gr.Slider(0.0, 1.0, value=0.05, step=0.01, label="Min-p (0 = off)")
             with gr.Row():
                 rep_penalty = gr.Slider(1.0, 2.0, value=1.05, step=0.01, label="Repetition penalty")
-                max_new = gr.Slider(32, 4096, value=768, step=16, label="Max new tokens")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+
+        with gr.Accordion("Advanced model settings", open=False):
+            with gr.Row():
+                family = gr.Dropdown(models.FAMILIES, value="Auto", label="Model family",
+                                     info="Override Auto for renamed encoders with ambiguous architecture.", scale=1)
+                tokenizer_override = gr.Textbox(label="Tokenizer directory (optional)", scale=3,
+                                               placeholder="Leave empty to use matching local Forge tokenizer files")
             with gr.Row():
                 device = gr.Dropdown(["auto (GPU if available)", "cuda", "cpu"], value="auto (GPU if available)", label="Device")
                 dtype = gr.Dropdown(["auto", "bfloat16", "float16", "float32"], value="auto", label="Compute dtype")
-                rope = gr.Dropdown(["Auto (Qwen3-VL / 2507: 5M, older Qwen3: 1M)", "1,000,000 (Qwen3)", "5,000,000 (Qwen3-VL)"],
-                                   value="Auto (Qwen3-VL / 2507: 5M, older Qwen3: 1M)", label="RoPE theta")
+                rope = gr.Dropdown(["Auto (checkpoint configuration / model profile)", "1,000,000 (Qwen3)", "5,000,000 (Qwen3-VL)"],
+                                   value="Auto (checkpoint configuration / model profile)", label="RoPE theta")
             with gr.Row():
                 keep_loaded = gr.Checkbox(value=False, label="Keep model loaded after generation (uses VRAM!)")
                 free_vram = gr.Checkbox(value=True, label="Unload Forge's image models from VRAM before loading the LLM")
-                keep_q = gr.Checkbox(value=True, label="Keep int8 / fp8 weights compressed in VRAM (recommended for 8 GB cards)")
+            with gr.Row():
+                keep_q = gr.Checkbox(value=True, label="Keep INT8 / FP8 / W4A8 / GGUF weights compressed (recommended)")
                 compress = gr.Checkbox(value=False, label="Also compress bf16 / fp16 weights to int8 on load (lets 8 GB cards run full-size files; tiny quality loss)")
-                empty_think = gr.Checkbox(value=False, label="Add empty <think></think> block (only for Qwen3 hybrid-thinking models)")
+
+        with gr.Accordion("LM head (for untied encoders with missing output weights)", open=False):
+            gr.Markdown(
+                "Known tied models need no extra weights. Qwen2.5-VL 7B and untied Qwen3/VL encoders need the exact "
+                "`lm_head.weight` tensor from the original model on Hugging Face; it is stored once in "
+                "`models/prompt_refiner/lm_heads/`. Select it explicitly unless its name matches the encoder stem or source metadata matches. "
+                "Matching tensor dimensions alone do not establish compatibility."
+            )
+            with gr.Row():
+                lm_choice = gr.Dropdown(label="LM head file", choices=["Auto"] + list_lm_heads(), value="Auto", scale=4)
+                lm_refresh = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
+            with gr.Row():
+                lm_repo = gr.Textbox(label="Hugging Face repo of the ORIGINAL model", placeholder="Qwen/Qwen3.5-9B", scale=4)
+                lm_token = gr.Textbox(label="HF token (only for gated repos)", type="password", scale=2)
+            with gr.Row():
+                lm_int8 = gr.Checkbox(value=True, label="Store as int8 (half the size)")
+                lm_btn = gr.Button("Download lm_head")
+            lm_status = gr.HTML(value="")
 
         # ---- events ----
         def _refresh(current):
@@ -879,6 +764,10 @@ def on_ui_tabs():
             return gr.update(choices=names, value=current if current in names else (names[0] if names else None))
 
         refresh_btn.click(_refresh, inputs=[encoder], outputs=[encoder])
+        lm_refresh.click(lambda cur: gr.update(choices=["Auto"] + list_lm_heads(), value=cur),
+                         inputs=[lm_choice], outputs=[lm_choice])
+        lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_int8, lm_token], outputs=[lm_status, lm_choice],
+                     show_progress="hidden")
 
         preset.change(lambda n: load_presets().get(n, ""), inputs=[preset], outputs=[system_prompt])
 
@@ -904,16 +793,22 @@ def on_ui_tabs():
 
         delete_btn.click(_delete, inputs=[preset], outputs=[preset, system_prompt])
 
+        def _run_with_details(*args):
+            """Keep routine status short and put model diagnostics in their own panel."""
+            for result, message, progress in run_refine(*args):
+                summary, _, details = message.partition("\n")
+                yield result, summary, progress, details
+
         run_btn.click(
-            run_refine,
+            _run_with_details,
             inputs=[encoder, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
-                    max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress],
-            outputs=[output, status, progress_html],
+                    max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress, lm_choice, family, tokenizer_override],
+            outputs=[output, status, progress_html, model_details],
             show_progress="hidden",
         )
         stop_btn.click(lambda: _STOP.set(), inputs=None, outputs=None)
         reuse_btn.click(lambda t: t, inputs=[output], outputs=[prompt])
-        unload_btn.click(unload_model, outputs=[status])
+        unload_btn.click(lambda: (unload_model(), ""), outputs=[status, model_details])
 
         send_txt.click(fn=None, inputs=[output], outputs=None, js=SEND_JS.replace("TAB", "txt2img"))
         send_img.click(fn=None, inputs=[output], outputs=None, js=SEND_JS.replace("TAB", "img2img"))
